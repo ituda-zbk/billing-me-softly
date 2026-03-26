@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local runtime data
+receipts.db
+
+# OCR/test artifacts
+uploads/
+tester*.png
+*_parsed.json
+
+# Local scratch
+old_scripts/
+nohup.out
