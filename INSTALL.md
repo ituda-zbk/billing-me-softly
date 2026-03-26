@@ -2,6 +2,7 @@
 
 ## Preduvjeti
 
+- Linux (trenutno jedina podrzana platforma, WSL na Windowsima takoder radi)
 - Python 3.10+
 - Google Gemini API kljuc ([generativelanguage.googleapis.com](https://ai.google.dev/))
 
