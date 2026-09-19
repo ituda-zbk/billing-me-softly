@@ -4,6 +4,7 @@
 from __future__ import annotations
 import argparse
 import base64
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
@@ -16,18 +17,20 @@ import threading
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import List, Optional
+from typing import Callable, Dict, List, Optional
 from uuid import uuid4
 from PIL import Image, ImageOps
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from flask import Flask, request, redirect, url_for, render_template_string, send_file, abort
+from flask import Flask, request, redirect, url_for, render_template_string, send_file, abort, jsonify
 from werkzeug.utils import secure_filename
 from config import (
     MAX_NEW_TOKENS,
     TOTAL_TOLERANCE,
     MAX_UPLOAD_FILES,
     UPLOAD_DIR,
+    DATA_DIR,
+    DEFAULT_DB_PATH,
     DEFAULT_LANG,
     DEFAULT_RESIZE_MAX,
     ENABLE_IMAGE_NORMALIZATION,
@@ -37,8 +40,16 @@ from config import (
     GEMINI_MAX_PARALLEL,
     GEMINI_REQUESTS_PER_MINUTE,
     GEMINI_MAX_429_RETRIES,
+    GEMINI_IMAGES_PER_REQUEST,
     ONEDRIVE_IMPORT_DIR,
 )
+
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
 
 
 
@@ -55,7 +66,7 @@ JSON shema:
   "items": [
     {
       "description": string,
-      "category": "Hrana | Cigarete, alkohol, kave,... | Kućne potrepštine | Lijekovi, troškovi liječenja | Odjeća i obuća | Škola i dječje aktivnosti | Sport | Automobili | Osiguranja | Internet/mobitel/TV | Struja | Voda | Plin | Smeće | Komunalni doprinos | Vodni doprinos | Putovanja, izleti, ručkovi | Ostalo" | null,
+      "category": "Hrana | Cigarete, alkohol, kave,... | Kućne potrepštine | Kućni ljubimci | Lijekovi, troškovi liječenja | Odjeća i obuća | Škola i dječje aktivnosti | Sport | Automobili | Osiguranja | Internet/mobitel/TV | Struja | Voda | Plin | Smeće | Komunalni doprinos | Vodni doprinos | Putovanja, izleti, ručkovi | Ostalo" | null,
       "quantity": number | null,
       "unit_price": number | null,
       "total_price": number | null
@@ -65,6 +76,37 @@ JSON shema:
   "date": "YYYY-MM-DD ili DD.MM.YYYY" | null,
   "time": "HH:MM[:SS]" | null
 }
+Pravila:
+- decimalne zareze pretvori u točku
+- nepoznate vrijednosti postavi na null
+""".strip()
+
+
+GEMINI_VISION_BATCH_PROMPT_TEMPLATE = """
+Dobit ćeš {n} slika računa, tim redoslijedom kojim su poslane (prva slika = index 0, druga = index 1, itd).
+Za SVAKU sliku vrati zaseban objekt u polju "receipts", s poljem "index" koje odgovara redoslijedu slike.
+Ako neku sliku ne možeš pročitati, svejedno vrati objekt za taj index s praznim "items": [] i "unreadable": true.
+
+Vrati isključivo valjani JSON bez markdowna, ove strukture:
+{{
+  "receipts": [
+    {{
+      "index": number,
+      "items": [
+        {{
+          "description": string,
+          "category": "Hrana | Cigarete, alkohol, kave,... | Kućne potrepštine | Kućni ljubimci | Lijekovi, troškovi liječenja | Odjeća i obuća | Škola i dječje aktivnosti | Sport | Automobili | Osiguranja | Internet/mobitel/TV | Struja | Voda | Plin | Smeće | Komunalni doprinos | Vodni doprinos | Putovanja, izleti, ručkovi | Ostalo" | null,
+          "quantity": number | null,
+          "unit_price": number | null,
+          "total_price": number | null
+        }}
+      ],
+      "total": number | null,
+      "date": "YYYY-MM-DD ili DD.MM.YYYY" | null,
+      "time": "HH:MM[:SS]" | null
+    }}
+  ]
+}}
 Pravila:
 - decimalne zareze pretvori u točku
 - nepoznate vrijednosti postavi na null
@@ -93,16 +135,19 @@ class ReceiptData:
 
 
 _THREAD_LOCAL = threading.local()
-_GEMINI_MAX_OUTPUT_TOKENS = min(MAX_NEW_TOKENS, 2048)
+_GEMINI_MAX_OUTPUT_TOKENS = min(MAX_NEW_TOKENS, 4096)
 _GEMINI_IMAGE_MAX_SIZE = (1400, 2600)
 _GEMINI_RATE_LOCK = threading.Lock()
-_GEMINI_NEXT_REQUEST_AT = 0.0
-_GEMINI_MIN_INTERVAL_SECONDS = 60.0 / max(1, GEMINI_REQUESTS_PER_MINUTE)
+_GEMINI_RECENT_REQUESTS: deque[float] = deque()
+_GEMINI_WINDOW_SECONDS = 60.0
+_GEMINI_MAX_PER_WINDOW = max(1, GEMINI_REQUESTS_PER_MINUTE)
+_GEMINI_MIN_INTERVAL_SECONDS = _GEMINI_WINDOW_SECONDS / _GEMINI_MAX_PER_WINDOW
 
 
 def get_db_connection(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -114,9 +159,7 @@ def init_db(db_path: str) -> None:
             CREATE TABLE IF NOT EXISTS receipts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 image_path TEXT UNIQUE NOT NULL,
-                json_path TEXT NOT NULL,
                 language TEXT,
-                data_json TEXT NOT NULL,
                 total REAL,
                 items_sum REAL,
                 date DATE,
@@ -132,36 +175,161 @@ def init_db(db_path: str) -> None:
             conn.execute("ALTER TABLE receipts ADD COLUMN warranty INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS receipt_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                receipt_id INTEGER NOT NULL REFERENCES receipts(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT,
+                quantity REAL,
+                unit_price REAL,
+                total_price REAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_receipt_items_receipt_id ON receipt_items(receipt_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_receipt_items_category ON receipt_items(category)"
+        )
         conn.commit()
+
+        _migrate_legacy_data_json(conn)
     finally:
         conn.close()
 
 
-def save_receipt_to_db(receipt: ReceiptData, json_path: str, db_path: str) -> None:
-    payload = json.dumps(serialise_receipt(receipt), ensure_ascii=False)
+def _migrate_legacy_data_json(conn: sqlite3.Connection) -> None:
+    """Jednokratna migracija sa starije sheme (data_json/json_path blob) na
+    normalizirane retke u receipt_items. Sigurno se poziva i kad stupci
+    data_json/json_path ne postoje (no-op)."""
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(receipts)")}
+    if "data_json" not in existing_columns:
+        return
+
+    cur = conn.execute("SELECT id, data_json FROM receipts")
+    rows = cur.fetchall()
+    for row in rows:
+        already_has_items = conn.execute(
+            "SELECT 1 FROM receipt_items WHERE receipt_id = ? LIMIT 1", (row["id"],)
+        ).fetchone()
+        if already_has_items:
+            continue
+        try:
+            data = json.loads(row["data_json"]) if row["data_json"] else {}
+        except json.JSONDecodeError:
+            data = {}
+        for position, item in enumerate(data.get("items", [])):
+            conn.execute(
+                """
+                INSERT INTO receipt_items
+                    (receipt_id, position, description, category, quantity, unit_price, total_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    position,
+                    item.get("description") or "",
+                    item.get("category"),
+                    _to_optional_float(item.get("quantity")),
+                    _to_optional_float(item.get("unit_price")),
+                    _to_optional_float(item.get("total_price")),
+                ),
+            )
+    conn.commit()
+
+    sqlite_version = tuple(int(part) for part in sqlite3.sqlite_version.split("."))
+    if sqlite_version >= (3, 35, 0):
+        for column in ("data_json", "json_path"):
+            if column in existing_columns:
+                try:
+                    conn.execute(f"ALTER TABLE receipts DROP COLUMN {column}")
+                except sqlite3.OperationalError:
+                    pass
+        conn.commit()
+
+
+def _replace_receipt_items(conn: sqlite3.Connection, receipt_id: int, items: List[dict]) -> None:
+    """Zamijeni sve stavke računa novim skupom (unutar postojeće transakcije)."""
+    conn.execute("DELETE FROM receipt_items WHERE receipt_id = ?", (receipt_id,))
+    conn.executemany(
+        """
+        INSERT INTO receipt_items
+            (receipt_id, position, description, category, quantity, unit_price, total_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                receipt_id,
+                position,
+                item.get("description") or "",
+                item.get("category"),
+                _to_optional_float(item.get("quantity")),
+                _to_optional_float(item.get("unit_price")),
+                _to_optional_float(item.get("total_price")),
+            )
+            for position, item in enumerate(items)
+        ],
+    )
+
+
+def fetch_receipt_items(receipt_id: int, db_path: str) -> List[dict]:
+    conn = get_db_connection(db_path)
+    try:
+        cur = conn.execute(
+            """
+            SELECT description, category, quantity, unit_price, total_price
+            FROM receipt_items
+            WHERE receipt_id = ?
+            ORDER BY position ASC
+            """,
+            (receipt_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def fetch_receipt_payload(row: sqlite3.Row, db_path: str) -> dict:
+    """Rekonstruira payload dict (image/language/items/...) iz normaliziranih
+    stupaca — isti oblik koji su template-i prije dobivali iz data_json bloba."""
+    return {
+        "image": row["image_path"],
+        "language": row["language"],
+        "items": fetch_receipt_items(row["id"], db_path),
+        "items_sum": row["items_sum"],
+        "total": row["total"],
+        "date": row["date"],
+        "time": row["time"],
+        "warranty": bool(row["warranty"]),
+    }
+
+
+def save_receipt_to_db(receipt: ReceiptData, db_path: str) -> None:
     now = datetime.now().isoformat(timespec="seconds")
     conn = get_db_connection(db_path)
     try:
-        conn.execute(
+        cur = conn.execute(
             """
-            INSERT INTO receipts (image_path, json_path, language, data_json, total, items_sum, date, time, warranty, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO receipts (image_path, language, total, items_sum, date, time, warranty, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(image_path) DO UPDATE SET
-                json_path=excluded.json_path,
                 language=excluded.language,
-                data_json=excluded.data_json,
                 total=excluded.total,
                 items_sum=excluded.items_sum,
                 date=excluded.date,
                 time=excluded.time,
                 warranty=excluded.warranty,
                 updated_at=excluded.updated_at
+            RETURNING id
             """,
             (
                 receipt.image,
-                os.path.abspath(json_path),
                 receipt.language,
-                payload,
                 receipt.total,
                 receipt.items_sum,
                 receipt.date,
@@ -171,6 +339,8 @@ def save_receipt_to_db(receipt: ReceiptData, json_path: str, db_path: str) -> No
                 now,
             ),
         )
+        receipt_id = cur.fetchone()["id"]
+        _replace_receipt_items(conn, receipt_id, [asdict(item) for item in receipt.items])
         conn.commit()
     finally:
         conn.close()
@@ -222,6 +392,17 @@ def fetch_all_receipts(
         if total_max is not None:
             filter_clauses.append("total <= ?")
             params.append(total_max)
+        item_search = filters.get("item_search")
+        if item_search:
+            filter_clauses.append(
+                """EXISTS (
+                    SELECT 1 FROM receipt_items ri
+                    WHERE ri.receipt_id = receipts.id
+                    AND (ri.description LIKE ? OR ri.category LIKE ?)
+                )"""
+            )
+            params.append(f"%{item_search}%")
+            params.append(f"%{item_search}%")
 
     where_clause = f"WHERE {' AND '.join(filter_clauses)}" if filter_clauses else ""
 
@@ -248,7 +429,7 @@ def fetch_all_receipts(
 
 def category_month_summary(db_path: str, year: int) -> tuple[dict, List[float]]:
     categories = [
-        "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Lijekovi, troškovi liječenja",
+        "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Kućni ljubimci","Lijekovi, troškovi liječenja",
         "Odjeća i obuća","Škola i dječje aktivnosti","Sport","Automobili","Osiguranja",
         "Internet/mobitel/TV","Struja","Voda","Plin","Smeće","Komunalni doprinos",
         "Vodni doprinos","Putovanja, izleti, ručkovi","Ostalo"
@@ -257,11 +438,16 @@ def category_month_summary(db_path: str, year: int) -> tuple[dict, List[float]]:
 
     conn = get_db_connection(db_path)
     try:
-        cur = conn.execute("SELECT data_json FROM receipts")
+        cur = conn.execute(
+            """
+            SELECT r.date AS entry_date, ri.category AS category, ri.total_price AS total_price
+            FROM receipts r
+            JOIN receipt_items ri ON ri.receipt_id = r.id
+            """
+        )
         rows = cur.fetchall()
         for row in rows:
-            data = json.loads(row["data_json"])
-            entry_date = data.get("date")
+            entry_date = row["entry_date"]
             if not entry_date:
                 continue
             parsed = None
@@ -274,12 +460,11 @@ def category_month_summary(db_path: str, year: int) -> tuple[dict, List[float]]:
             if parsed is None or parsed.year != year:
                 continue
             month_index = parsed.month - 1
-            for item in data.get("items", []):
-                category = item.get("category") or "Ostalo"
-                total_price = item.get("total_price") or 0.0
-                if category not in summary:
-                    summary[category] = [0.0] * 12
-                summary[category][month_index] += float(total_price or 0.0)
+            category = row["category"] or "Ostalo"
+            total_price = row["total_price"] or 0.0
+            if category not in summary:
+                summary[category] = [0.0] * 12
+            summary[category][month_index] += float(total_price or 0.0)
     finally:
         conn.close()
     monthly_totals = [0.0] * 12
@@ -302,10 +487,17 @@ def fetch_category_items_for_month(
     items: List[dict] = []
     conn = get_db_connection(db_path)
     try:
-        cur = conn.execute("SELECT id, data_json FROM receipts")
+        cur = conn.execute(
+            """
+            SELECT r.id AS receipt_id, r.date AS entry_date, r.time AS entry_time,
+                   ri.description AS description, ri.category AS category,
+                   ri.quantity AS quantity, ri.unit_price AS unit_price, ri.total_price AS total_price
+            FROM receipts r
+            JOIN receipt_items ri ON ri.receipt_id = r.id
+            """
+        )
         for row in cur:
-            data = json.loads(row["data_json"])
-            entry_date = data.get("date")
+            entry_date = row["entry_date"]
             if not entry_date:
                 continue
 
@@ -323,23 +515,22 @@ def fetch_category_items_for_month(
             if parsed.year != year or parsed.month != month:
                 continue
 
-            for item in data.get("items", []):
-                item_category = item.get("category") or "Ostalo"
-                if item_category != category:
-                    continue
+            item_category = row["category"] or "Ostalo"
+            if item_category != category:
+                continue
 
-                items.append(
-                    {
-                        "receipt_id": row["id"],
-                        "description": item.get("description") or "",
-                        "category": item_category,
-                        "quantity": _to_optional_float(item.get("quantity")),
-                        "unit_price": _to_optional_float(item.get("unit_price")),
-                        "total_price": _to_optional_float(item.get("total_price")),
-                        "raw_date": entry_date,
-                        "time": data.get("time"),
-                    }
-                )
+            items.append(
+                {
+                    "receipt_id": row["receipt_id"],
+                    "description": row["description"] or "",
+                    "category": item_category,
+                    "quantity": row["quantity"],
+                    "unit_price": row["unit_price"],
+                    "total_price": row["total_price"],
+                    "raw_date": entry_date,
+                    "time": row["entry_time"],
+                }
+            )
     finally:
         conn.close()
 
@@ -383,25 +574,25 @@ def fetch_receipt_record(receipt_id: int, db_path: str) -> sqlite3.Row:
 
 def update_receipt_record(receipt_id: int, data: dict, db_path: str) -> None:
     now = datetime.now().isoformat(timespec="seconds")
-    payload = json.dumps(data, ensure_ascii=False)
     conn = get_db_connection(db_path)
     try:
         conn.execute(
             """
             UPDATE receipts
-            SET data_json = ?, total = ?, items_sum = ?, date = ?, time = ?, updated_at = ?
+            SET total = ?, items_sum = ?, date = ?, time = ?, warranty = ?, updated_at = ?
             WHERE id = ?
             """,
             (
-                payload,
                 data.get("total"),
                 data.get("items_sum"),
                 data.get("date"),
                 data.get("time"),
+                1 if data.get("warranty") else 0,
                 now,
                 receipt_id,
             ),
         )
+        _replace_receipt_items(conn, receipt_id, data.get("items", []))
         conn.commit()
     finally:
         conn.close()
@@ -570,45 +761,84 @@ def _extract_json_object(s: str) -> str | None:
     return None
 
 
-def _truncate_broken_items_array(s: str) -> str:
+def _truncate_broken_items_array(s: str, key: str = '"items"') -> str:
     """
-    Ako postoji polje "items": [ ... ] i zadnji element liste je napola
-    (ili model nakon toga još nešto nadrobio), pokušaj odrezati sve
-    iza zadnje zatvorene vitičaste zagrade '}' unutar te liste.
+    Ako postoji polje "items": [ ... ] (ili "receipts": [ ... ] za batch odgovore,
+    gdje svaki element sam sadrži svoj ugniježđeni "items": [...]) i zadnji
+    element liste je napola (ili je model nakon toga nastavio brbljati),
+    odreži sve iza zadnjeg POTPUNO zatvorenog top-level elementa te liste,
+    zatvori listu, pa zatvori sve zagrade koje su bile otvorene prije nje.
 
-    Ideja: bolje izgubiti 1 polu-razvijenu stavku nego cijeli JSON.
+    Depth-aware (prati ugnježđivanje i ignorira zagrade unutar stringova) —
+    naivan rfind("]") bi za "receipts" slučaj znao pogoditi zatvaranje
+    UNUTARNJEG "items" niza umjesto vanjskog "receipts" niza.
+
+    Ideja: bolje izgubiti 1 polu-razvijeni element nego cijeli JSON.
     """
-    key = '"items"'
     key_idx = s.find(key)
     if key_idx == -1:
         return s
 
-    # Nađi početak liste '[' nakon "items"
     bracket_start = s.find("[", key_idx)
     if bracket_start == -1:
         return s
 
-    # Nađi zadnju ']' koja zatvara tu listu (grubo, ali dovoljno dobro za naš slučaj)
-    bracket_end = s.rfind("]")
-    if bracket_end == -1 or bracket_end < bracket_start:
+    depth = 0
+    in_string = False
+    escape = False
+    last_complete_end = None
+    for i in range(bracket_start + 1, len(s)):
+        ch = s[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            if ch == "}" and depth == 1:
+                last_complete_end = i
+            depth -= 1
+            if depth <= 0 and ch == "]":
+                # Lista se čisto zatvorila — ništa nije bilo slomljeno.
+                return s
+
+    if last_complete_end is None:
         return s
 
-    arr_str = s[bracket_start: bracket_end + 1]
+    prefix = s[:bracket_start]
+    open_count = 0
+    p_in_string = False
+    p_escape = False
+    for ch in prefix:
+        if p_escape:
+            p_escape = False
+            continue
+        if ch == "\\":
+            p_escape = True
+            continue
+        if ch == '"':
+            p_in_string = not p_in_string
+            continue
+        if p_in_string:
+            continue
+        if ch in "{[":
+            open_count += 1
+        elif ch in "}]":
+            open_count -= 1
 
-    # Zadnja zatvorena '}' unutar liste – tu režemo
-    last_obj_end = arr_str.rfind("}")
-    if last_obj_end == -1:
-        return s
+    # Sve zagrade otvorene prije ove liste su, za naš JSON oblik
+    # ({"items"/"receipts": [...]} , po potrebi ugniježđeno), uvijek objekti.
+    new_s = prefix + s[bracket_start : last_complete_end + 1] + "]" + ("}" * max(open_count, 0))
 
-    # Nova lista: od '[' do zadnje '}', pa zatvori s ']'
-    new_arr_str = arr_str[: last_obj_end + 1] + "]"
-
-    # Sastavi novi string
-    new_s = s[:bracket_start] + new_arr_str + s[bracket_end + 1 :]
-
-    # Za svaki slučaj, opet pobriši trailing comma
-    new_s = re.sub(r",(\s*[}\]])", r"\1", new_s)
-    return new_s
+    return re.sub(r",(\s*[}\]])", r"\1", new_s)
 
 
 def _repair_json_str(s: str) -> str:
@@ -676,6 +906,37 @@ def parse_llm_json(text: str) -> dict:
         )
 
 
+def parse_llm_batch_json(text: str) -> dict:
+    """
+    Isto kao parse_llm_json, ali salvage korak (3) reže po "receipts" polju
+    umjesto po "items" polju — koristi se za multi-image batch odgovore.
+    """
+    raw = text
+    stripped = _strip_code_fences(raw)
+
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    repaired = _repair_json_str(stripped)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+
+    salvaged = _truncate_broken_items_array(repaired, key='"receipts"')
+    try:
+        return json.loads(salvaged)
+    except json.JSONDecodeError as exc:
+        preview = raw
+        if len(preview) > 1200:
+            preview = preview[:1200] + "... [skraceno]"
+        raise ValueError(
+            f"LLM batch response is not valid JSON ni nakon pokušaja popravka: {exc}\n\nSirovi odgovor modela:\n{preview}"
+        )
+
+
 
 def _guess_mime_type(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
@@ -687,6 +948,15 @@ def _guess_mime_type(path: str) -> str:
         return "image/jpeg"
     # fallback – većina računa će biti jpg/png, ali neka
     return "image/jpeg"
+
+
+class GeminiDailyQuotaExceeded(RuntimeError):
+    """Iscrpljena dnevna Gemini kvota — retry nema smisla, čekaj do reset-a."""
+
+    def __init__(self, reason: str, retry_after_seconds: Optional[float] = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after_seconds = retry_after_seconds
 
 
 def _gemini_session() -> requests.Session:
@@ -712,14 +982,43 @@ def _gemini_session() -> requests.Session:
 
 
 def _reserve_gemini_request_slot() -> None:
-    global _GEMINI_NEXT_REQUEST_AT
+    """Klizni prozor: najviše _GEMINI_MAX_PER_WINDOW zahtjeva u 60 s, uz razmak između njih."""
     with _GEMINI_RATE_LOCK:
-        now = time.monotonic()
-        wait_seconds = max(0.0, _GEMINI_NEXT_REQUEST_AT - now)
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
+        while True:
             now = time.monotonic()
-        _GEMINI_NEXT_REQUEST_AT = now + _GEMINI_MIN_INTERVAL_SECONDS
+            cutoff = now - _GEMINI_WINDOW_SECONDS
+            while _GEMINI_RECENT_REQUESTS and _GEMINI_RECENT_REQUESTS[0] <= cutoff:
+                _GEMINI_RECENT_REQUESTS.popleft()
+
+            if len(_GEMINI_RECENT_REQUESTS) >= _GEMINI_MAX_PER_WINDOW:
+                # Prozor je pun – čekaj da najstariji zahtjev ispadne iz njega
+                time.sleep(_GEMINI_RECENT_REQUESTS[0] + _GEMINI_WINDOW_SECONDS - now + 0.5)
+                continue
+
+            if _GEMINI_RECENT_REQUESTS:
+                since_last = now - _GEMINI_RECENT_REQUESTS[-1]
+                if since_last < _GEMINI_MIN_INTERVAL_SECONDS:
+                    time.sleep(_GEMINI_MIN_INTERVAL_SECONDS - since_last)
+                    continue
+
+            _GEMINI_RECENT_REQUESTS.append(now)
+            return
+
+
+def _gemini_error_object(payload: object) -> dict:
+    """Sigurno izvuci `error` objekt iz Gemini odgovora (prazan dict ako ga nema)."""
+    if not isinstance(payload, dict):
+        return {}
+    error = payload.get("error")
+    return error if isinstance(error, dict) else {}
+
+
+def _gemini_error_details(payload: object) -> List[dict]:
+    """Vrati `error.details` unose koji su dictovi (prazna lista ako ih nema)."""
+    details = _gemini_error_object(payload).get("details")
+    if not isinstance(details, list):
+        return []
+    return [detail for detail in details if isinstance(detail, dict)]
 
 
 def _parse_retry_delay_seconds(response: requests.Response) -> float:
@@ -729,21 +1028,16 @@ def _parse_retry_delay_seconds(response: requests.Response) -> float:
     except ValueError:
         payload = None
 
-    if isinstance(payload, dict):
-        details = payload.get("error", {}).get("details", [])
-        if isinstance(details, list):
-            for detail in details:
-                if not isinstance(detail, dict):
-                    continue
-                retry_value = detail.get("retryDelay")
-                if isinstance(retry_value, str) and retry_value.endswith("s"):
-                    try:
-                        return max(float(retry_value[:-1]), 0.5)
-                    except ValueError:
-                        continue
+    for detail in _gemini_error_details(payload):
+        retry_value = detail.get("retryDelay")
+        if isinstance(retry_value, str) and retry_value.endswith("s"):
+            try:
+                return max(float(retry_value[:-1]), 0.5)
+            except ValueError:
+                continue
 
     text = response.text or ""
-    match = re.search(r"Please retry in ([0-9]+(?:\\.[0-9]+)?)s", text)
+    match = re.search(r"Please retry in ([0-9]+(?:\.[0-9]+)?)s", text)
     if match:
         try:
             return max(float(match.group(1)), 0.5)
@@ -752,29 +1046,92 @@ def _parse_retry_delay_seconds(response: requests.Response) -> float:
     return default_delay
 
 
-def call_gemini_vision_parser(image_path: str) -> dict:
+def _summarize_429_reason(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return (response.text or "")[:200]
+
+    message = _gemini_error_object(payload).get("message", "")
+    quota_id = ""
+    quota_metric = ""
+    for detail in _gemini_error_details(payload):
+        violations = detail.get("violations")
+        if not isinstance(violations, list):
+            continue
+        for violation in violations:
+            if isinstance(violation, dict):
+                quota_id = violation.get("quotaId") or quota_id
+                quota_metric = violation.get("quotaMetric") or quota_metric
+
+    parts = [part for part in (quota_id, quota_metric, message) if part]
+    summary = " | ".join(parts) if parts else (response.text or "")
+    return summary[:300]
+
+
+def _classify_429(response: requests.Response) -> tuple[bool, str, float]:
+    """Vrati (is_daily_quota, reason_summary, retry_after_seconds)."""
+    reason = _summarize_429_reason(response)
+    retry_after = _parse_retry_delay_seconds(response)
+    is_daily = (
+        "PerDay" in reason
+        or "PerProjectPerModel-FreeTier" in reason
+        or "free_tier_requests" in reason
+    )
+    return is_daily, reason, retry_after
+
+
+def _gemini_api_key() -> str:
     api_key = os.environ.get(GEMINI_API_KEY_ENV)
     if not api_key:
         raise RuntimeError(
             f"Očekujem varijablu okoline {GEMINI_API_KEY_ENV} s Gemini API ključem."
         )
+    return api_key
 
+
+def _post_gemini_generate_content(payload: dict) -> dict:
+    """POST na generateContent uz 429 retry i detekciju dnevne kvote.
+
+    Zajednički za jednu-sliku i batch (multi-image) pozive — RPM/RPD budžet
+    se troši po zahtjevu, bez obzira nosi li taj zahtjev 1 ili N slika.
+    """
+    api_key = _gemini_api_key()
+    url = f"{GEMINI_ENDPOINT}/{GEMINI_MODEL}:generateContent?key={api_key}"
+    for attempt in range(GEMINI_MAX_429_RETRIES + 1):
+        _reserve_gemini_request_slot()
+        resp = _gemini_session().post(url, json=payload, timeout=(10, 90))
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code != 429 or attempt >= GEMINI_MAX_429_RETRIES:
+            raise RuntimeError(f"Gemini Vision API error {resp.status_code}: {resp.text}")
+        is_daily, reason, sleep_seconds = _classify_429(resp)
+        if is_daily:
+            log_progress(f"Gemini DNEVNA kvota iscrpljena, prekidam batch. Razlog: {reason}")
+            raise GeminiDailyQuotaExceeded(reason, retry_after_seconds=sleep_seconds)
+        log_progress(
+            f"Gemini quota/rate limit (429), čekam {sleep_seconds:.1f}s "
+            f"prije ponovnog pokušaja ({attempt + 1}/{GEMINI_MAX_429_RETRIES}). "
+            f"Razlog: {reason}"
+        )
+        time.sleep(sleep_seconds)
+    raise AssertionError("unreachable")
+
+
+def _image_to_inline_part(image_path: str) -> dict:
     mime_type = _guess_mime_type(image_path)
-
     with open(image_path, "rb") as f:
         img_base64 = base64.b64encode(f.read()).decode("utf-8")
+    return {"inline_data": {"mime_type": mime_type, "data": img_base64}}
 
+
+def call_gemini_vision_parser(image_path: str) -> dict:
     payload = {
         "contents": [
             {
                 "parts": [
                     {"text": GEMINI_VISION_PROMPT},
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": img_base64,
-                        }
-                    },
+                    _image_to_inline_part(image_path),
                 ]
             }
         ],
@@ -787,28 +1144,67 @@ def call_gemini_vision_parser(image_path: str) -> dict:
         },
     }
 
-    url = f"{GEMINI_ENDPOINT}/{GEMINI_MODEL}:generateContent?key={api_key}"
-    for attempt in range(GEMINI_MAX_429_RETRIES + 1):
-        _reserve_gemini_request_slot()
-        resp = _gemini_session().post(url, json=payload, timeout=(10, 90))
-        if resp.status_code == 200:
-            break
-        if resp.status_code != 429 or attempt >= GEMINI_MAX_429_RETRIES:
-            raise RuntimeError(f"Gemini Vision API error {resp.status_code}: {resp.text}")
-        sleep_seconds = _parse_retry_delay_seconds(resp)
-        log_progress(
-            f"Gemini quota/rate limit (429), čekam {sleep_seconds:.1f}s "
-            f"prije ponovnog pokušaja ({attempt + 1}/{GEMINI_MAX_429_RETRIES})."
-        )
-        time.sleep(sleep_seconds)
-
-    data = resp.json()
+    data = _post_gemini_generate_content(payload)
     try:
         model_text = data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as exc:
         raise RuntimeError(f"Neočekivan odgovor Gemini Vision modela: {data}") from exc
 
     return parse_llm_json(model_text)
+
+
+def _gemini_batch_max_output_tokens(n: int) -> int:
+    """Output-token budžet raste s brojem slika u zahtjevu (~300 tok./račun izmjereno)."""
+    return min(MAX_NEW_TOKENS, max(4096, 700 * n))
+
+
+def call_gemini_vision_batch_parser(image_paths: List[str]) -> Dict[int, Optional[dict]]:
+    """Pošalji N slika u JEDNOM Gemini zahtjevu i vrati {index: raw_llm_payload}.
+
+    KRITIČNO: ako Gemini ne vrati jasan, jedinstven "index" za neku sliku
+    (nedostaje, dupliciran je, izvan raspona, ili je odgovor skraćen prije
+    nego što je taj receipt stigao), ta slika NIJE obrađena — mapira se na
+    None, i pozivatelj je NIKAD ne smije spremiti kao uspješan rezultat.
+    """
+    n = len(image_paths)
+    parts = [{"text": GEMINI_VISION_BATCH_PROMPT_TEMPLATE.format(n=n)}]
+    parts.extend(_image_to_inline_part(p) for p in image_paths)
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": _gemini_batch_max_output_tokens(n),
+            "thinkingConfig": {
+                "thinkingBudget": 0
+            },
+        },
+    }
+
+    data = _post_gemini_generate_content(payload)
+    try:
+        model_text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as exc:
+        raise RuntimeError(f"Neočekivan odgovor Gemini Vision modela (batch): {data}") from exc
+
+    parsed = parse_llm_batch_json(model_text)
+    receipts = parsed.get("receipts", []) if isinstance(parsed, dict) else []
+
+    by_index: Dict[int, dict] = {}
+    for r in receipts:
+        if not isinstance(r, dict):
+            continue
+        idx = r.get("index")
+        if isinstance(idx, int) and 0 <= idx < n and idx not in by_index:
+            by_index[idx] = r
+        else:
+            log_progress(f"Gemini batch: ignoriram receipt s nevaljanim/dupliciranim indexom {idx!r}")
+
+    missing = [i for i in range(n) if i not in by_index]
+    if missing:
+        log_progress(f"Gemini batch: nije vraćen rezultat za {len(missing)}/{n} slika (indexi: {missing})")
+
+    return {i: by_index.get(i) for i in range(n)}
 
 
 
@@ -826,16 +1222,12 @@ def prepare_image_for_gemini(image_path: str) -> str:
     return image_path
 
 
-def process_single_image(image_path: str, language: str, source_path: Optional[str] = None) -> dict:
-    used_path = prepare_image_for_gemini(image_path)
-    receipt = build_receipt_data(used_path, language)
+def _package_processed_entry(used_path: str, receipt: ReceiptData, source_path: Optional[str]) -> dict:
     payload = serialise_receipt(receipt)
     payload.setdefault("warranty", False)
-    json_output = os.path.splitext(used_path)[0] + "_parsed.json"
     return {
         "image_path": used_path,
         "preview_path": used_path,
-        "json_path": json_output,
         "payload": payload,
         "progress": [],
         "warranty": False,
@@ -843,25 +1235,303 @@ def process_single_image(image_path: str, language: str, source_path: Optional[s
     }
 
 
-def process_images_batch(jobs: List[tuple[str, Optional[str]]], language: str) -> List[dict]:
+def process_single_image(image_path: str, language: str, source_path: Optional[str] = None) -> dict:
+    used_path = prepare_image_for_gemini(image_path)
+    receipt = build_receipt_data(used_path, language)
+    return _package_processed_entry(used_path, receipt, source_path)
+
+
+def _validate_image_readable(path: str) -> None:
+    """Baca iznimku ako datoteka ne postoji, prazna je (0 bajtova) ili je PIL
+    ne prepoznaje kao sliku. Koristi se da jedna neispravna slika (npr. 0-byte
+    datoteka nastala neuspjelim uploadom) ne obori CIJELI Gemini batch zahtjev
+    — cijeli chunk inače ide kao JEDAN HTTP poziv, pa neispravna slika unutar
+    njega uzrokuje 400 za sve slike iz tog chunka, ne samo za neispravnu.
+    """
+    if not os.path.exists(path):
+        raise ValueError("datoteka ne postoji na disku")
+    if os.path.getsize(path) == 0:
+        raise ValueError("datoteka je prazna (0 bajtova) — upload vjerojatno nije uspio")
+    with Image.open(path) as img:
+        img.verify()
+
+
+def process_image_chunk(
+    chunk: List[tuple[int, str, Optional[str]]], language: str
+) -> Dict[int, dict]:
+    """Obradi do GEMINI_IMAGES_PER_REQUEST slika kroz JEDAN Gemini zahtjev.
+
+    `chunk`: [(global_idx, image_path, source_path), ...]
+    Vraća {global_idx: {"ok": entry} | {"error": poruka}}.
+
+    Slika za koju Gemini nije vratio jasan index (vidi
+    call_gemini_vision_batch_parser) NIKAD ne prolazi kroz
+    _build_receipt_data_from_payload/_package_processed_entry — uvijek
+    završava kao "error", nikad kao lažno uspješan rezultat.
+
+    Prije slanja Gemini-ju svaka se slika provjerava (_validate_image_readable)
+    — neispravna/prazna slika odmah postaje "error" SAMO za taj indeks i
+    izbacuje se iz zahtjeva, umjesto da sruši cijeli chunk (i time i ostale,
+    ispravne slike iz istog zahtjeva).
+    """
+    out: Dict[int, dict] = {}
+    prepared: List[tuple[int, str, Optional[str]]] = []
+    for gidx, path, src in chunk:
+        used_path = prepare_image_for_gemini(path)
+        try:
+            _validate_image_readable(used_path)
+        except Exception as exc:
+            out[gidx] = {"error": f"Slika je neispravna i preskočena: {exc}"}
+            continue
+        prepared.append((gidx, used_path, src))
+
+    if not prepared:
+        return out
+
+    batch_payloads = call_gemini_vision_batch_parser([p for _, p, _ in prepared])
+
+    for local_i, (gidx, used_path, src) in enumerate(prepared):
+        llm_payload = batch_payloads.get(local_i)
+        if llm_payload is None:
+            out[gidx] = {"error": "Gemini nije vratio rezultat za ovu sliku u ovom batchu"}
+            continue
+        receipt = _build_receipt_data_from_payload(llm_payload, used_path, language)
+        out[gidx] = {"ok": _package_processed_entry(used_path, receipt, src)}
+    return out
+
+
+def process_images_batch(
+    jobs: List[tuple[str, Optional[str]]],
+    language: str,
+    on_status: Optional[Callable[[int, str, Optional[str]], None]] = None,
+) -> tuple[List[dict], List[str]]:
+    """Vraća (uspješni_rezultati, lista_grešaka).
+
+    `on_status(idx, status, error)` je opcionalni callback (status je
+    "processing" | "done" | "error") kojim pozivatelj može pratiti napredak
+    po pojedinačnoj slici dok batch teče (npr. za prikaz u UI-u).
+
+    Slike se grupiraju u chunkove od GEMINI_IMAGES_PER_REQUEST i šalju
+    Gemini-ju kao jedan zahtjev po chunku (RPD kvota je po zahtjevu, ne po
+    slici) — svaki chunk se izvršava kao jedan posao u thread poolu, ali
+    on_status/rezultati/greške i dalje su po pojedinačnoj slici.
+    """
     if not jobs:
-        return []
-    workers = min(max(1, GEMINI_MAX_PARALLEL), max(1, len(jobs)))
+        return [], []
+
+    indexed_jobs = list(enumerate(jobs))
+    chunk_size = max(1, GEMINI_IMAGES_PER_REQUEST)
+    chunks = [
+        [(gidx, path, source_path) for gidx, (path, source_path) in indexed_jobs[i : i + chunk_size]]
+        for i in range(0, len(indexed_jobs), chunk_size)
+    ]
+
+    workers = min(max(1, GEMINI_MAX_PARALLEL), len(chunks))
     results: List[Optional[dict]] = [None] * len(jobs)
-    log_progress(f"Paralelna obrada računa: {len(jobs)} datoteka, {workers} radnika.")
+    errors: List[str] = []
+    daily_quota_hit = threading.Event()
+    quota_reason = ""
+
+    def process_chunk_job(chunk: List[tuple[int, str, Optional[str]]]) -> Dict[int, dict]:
+        """Circuit breaker: kad je dnevna kvota potrošena, preostali chunkovi odmah odustaju."""
+        nonlocal quota_reason
+        if daily_quota_hit.is_set():
+            raise GeminiDailyQuotaExceeded(quota_reason or "preskočeno zbog dnevne kvote")
+        if on_status:
+            for gidx, _path, _src in chunk:
+                on_status(gidx, "processing", None)
+        try:
+            return process_image_chunk(chunk, language)
+        except GeminiDailyQuotaExceeded as exc:
+            quota_reason = exc.reason
+            daily_quota_hit.set()
+            raise
+
+    log_progress(
+        f"Paralelna obrada računa: {len(jobs)} datoteka u {len(chunks)} chunk(ova) "
+        f"(do {chunk_size} slika/zahtjev), {workers} radnika."
+    )
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(process_single_image, image_path, language, source_path): idx
-            for idx, (image_path, source_path) in enumerate(jobs)
-        }
+        futures = {executor.submit(process_chunk_job, chunk): chunk for chunk in chunks}
         for future in as_completed(futures):
-            idx = futures[future]
+            chunk = futures[future]
             try:
-                results[idx] = future.result()
+                chunk_results = future.result()
+                for gidx, outcome in chunk_results.items():
+                    if "ok" in outcome:
+                        results[gidx] = outcome["ok"]
+                        if on_status:
+                            on_status(gidx, "done", None)
+                    else:
+                        failed_file = os.path.basename(jobs[gidx][0])
+                        errors.append(f"{failed_file}: {outcome['error']}")
+                        if on_status:
+                            on_status(gidx, "error", outcome["error"])
+            except GeminiDailyQuotaExceeded as exc:
+                error_text = f"dnevna kvota ({exc.reason})"
+                for gidx, _path, _src in chunk:
+                    failed_file = os.path.basename(jobs[gidx][0])
+                    errors.append(f"{failed_file}: {error_text}")
+                    if on_status:
+                        on_status(gidx, "error", error_text)
             except Exception as exc:
-                failed_file = os.path.basename(jobs[idx][0])
-                raise RuntimeError(f"{failed_file}: {exc}") from exc
-    return [entry for entry in results if entry is not None]
+                log_progress(f"Greška pri obradi chunka: {exc}")
+                for gidx, _path, _src in chunk:
+                    failed_file = os.path.basename(jobs[gidx][0])
+                    errors.append(f"{failed_file}: {exc}")
+                    if on_status:
+                        on_status(gidx, "error", str(exc))
+
+    return [entry for entry in results if entry is not None], errors
+
+
+# --- In-memory store za status batch obrade (za /batch/<id> live-status stranicu) ---
+_upload_batches: Dict[str, dict] = {}
+_upload_batches_lock = threading.Lock()
+_BATCH_TTL_SECONDS = 7200  # 2h — čisti napuštene batcheve koje korisnik nikad nije pregledao
+
+
+def _cleanup_expired_batches() -> None:
+    now = time.time()
+    with _upload_batches_lock:
+        expired = [
+            batch_id
+            for batch_id, batch in _upload_batches.items()
+            if now - batch["created_at"] > _BATCH_TTL_SECONDS
+        ]
+        for batch_id in expired:
+            del _upload_batches[batch_id]
+
+
+def _create_batch(
+    jobs: List[tuple[str, Optional[str]]], lang: str, model: str, stored_verb: str
+) -> str:
+    _cleanup_expired_batches()
+    batch_id = uuid4().hex
+    files = [
+        {"idx": idx, "name": os.path.basename(path), "status": "queued", "error": None}
+        for idx, (path, _source) in enumerate(jobs)
+    ]
+    with _upload_batches_lock:
+        _upload_batches[batch_id] = {
+            "id": batch_id,
+            "created_at": time.time(),
+            "lang": lang,
+            "model": model,
+            "stored_verb": stored_verb,
+            "files": files,
+            "status": "running",
+            "processed_entries": None,
+            "batch_errors": None,
+        }
+    return batch_id
+
+
+def _set_batch_status(batch_id: str, idx: int, status: str, error: Optional[str] = None) -> None:
+    with _upload_batches_lock:
+        batch = _upload_batches.get(batch_id)
+        if not batch:
+            return
+        batch["files"][idx]["status"] = status
+        batch["files"][idx]["error"] = error
+
+
+def _finish_batch(
+    batch_id: str, processed_entries: List[dict], batch_errors: List[str]
+) -> None:
+    with _upload_batches_lock:
+        batch = _upload_batches.get(batch_id)
+        if not batch:
+            return
+        batch["status"] = "done"
+        batch["processed_entries"] = processed_entries
+        batch["batch_errors"] = batch_errors
+
+
+def _get_batch(batch_id: str) -> Optional[dict]:
+    with _upload_batches_lock:
+        return _upload_batches.get(batch_id)
+
+
+def _pop_batch(batch_id: str) -> Optional[dict]:
+    with _upload_batches_lock:
+        return _upload_batches.pop(batch_id, None)
+
+
+def _run_batch_in_background(
+    batch_id: str, jobs: List[tuple[str, Optional[str]]], lang: str
+) -> None:
+    def on_status(idx: int, status: str, error: Optional[str] = None) -> None:
+        _set_batch_status(batch_id, idx, status, error)
+
+    try:
+        processed_entries, batch_errors = process_images_batch(jobs, lang, on_status=on_status)
+    except Exception as exc:
+        log_progress(f"Batch {batch_id} neočekivano pukao: {exc}")
+        processed_entries, batch_errors = [], [str(exc)]
+    _finish_batch(batch_id, processed_entries, batch_errors)
+
+
+def batch_failure_message(batch_errors: List[str], image_count: int, stored_verb: str) -> str:
+    """Poruka za korisnika kad nijedna slika iz batcha nije obrađena."""
+    if any("dnevna kvota" in error for error in batch_errors):
+        return (
+            f"Iscrpljena dnevna Gemini kvota. {image_count} slika je {stored_verb} "
+            f"u uploads/ ali nije obrađeno. Pokušaj ponovno nakon resetiranja kvote "
+            f"(~09:00 hrvatskog vremena)."
+        )
+    if batch_errors:
+        return "Nijedna slika nije uspješno obrađena. Greške: " + "; ".join(batch_errors)
+    return "Nijedna slika nije uspješno obrađena."
+
+
+def render_review_page(
+    processed_entries: List[dict],
+    batch_errors: List[str],
+    upload_lang: str,
+    upload_model: str,
+) -> str:
+    """Prikaži prvi obrađeni račun za pregled; ostali čekaju u pending listi."""
+    first_entry = processed_entries[0]
+    pending_entries = processed_entries[1:]
+    preview_image_path = first_entry["preview_path"]
+
+    preview_image_mtime = None
+    if preview_image_path and os.path.exists(preview_image_path):
+        preview_image_mtime = int(os.path.getmtime(preview_image_path))
+
+    rotate_target = (
+        preview_image_path
+        if preview_image_path and not preview_image_path.startswith("manual://")
+        else None
+    )
+
+    progress = list(first_entry["progress"])
+    if batch_errors:
+        progress.append(f"⚠ Neuspjelo ({len(batch_errors)}): " + "; ".join(batch_errors))
+
+    return render_template_string(
+        DETAIL_TEMPLATE,
+        receipt={"id": None, "image_path": first_entry["image_path"]},
+        data=first_entry["payload"],
+        items=first_entry["payload"]["items"],
+        saved=False,
+        is_new=True,
+        image_path=first_entry["image_path"],
+        preview_image_path=preview_image_path,
+        preview_image_mtime=preview_image_mtime,
+        base_payload=first_entry["payload"],
+        progress=progress,
+        default_lang=upload_lang,
+        default_model=upload_model,
+        pending_payloads=pending_entries,
+        pending_count=len(pending_entries),
+        rotate_target=rotate_target,
+        current_url=request.url,
+        format_date=_format_date_for_display,
+        form_error=None,
+        source_path=first_entry.get("source_path"),
+    )
 
 
 def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
@@ -873,7 +1543,7 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         sort_by = request.args.get("sort", "date")
         direction = request.args.get("dir", "desc")
         limit_param = request.args.get("limit", "100")
-        allowed_limits = ["10", "20", "50", "100", "all"]
+        allowed_limits = ["100", "200", "500", "all"]
 
         if limit_param not in allowed_limits:
             limit_param = "all"
@@ -886,6 +1556,7 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             "total_min": _to_optional_float(total_min_raw) if total_min_raw else None,
             "total_max": _to_optional_float(total_max_raw) if total_max_raw else None,
             "warranty": request.args.get("warranty_filter") if request.args.get("warranty_filter") in {"0", "1"} else None,
+            "item_search": request.args.get("item_search", "").strip() or None,
         }
         receipts = fetch_all_receipts(db_path, sort_by, direction, limit_value, filters)
         available_years = fetch_years(db_path)
@@ -924,8 +1595,6 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             receipts=receipts,
             error_message=request.args.get("error"),
             progress=[],
-            default_lang=default_lang,
-            default_model=default_model,
             sort_by=sort_by,
             direction=direction,
             filters=filters,
@@ -935,7 +1604,6 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             current_year=selected_year,
             available_years=available_years,
             monthly_totals=monthly_totals,
-            total_sum=sum(monthly_totals),
             month_names=["Siječanj","Veljača","Ožujak","Travanj","Svibanj","Lipanj","Srpanj","Kolovoz","Rujan","Listopad","Studeni","Prosinac"],
             format_date=_format_date_for_display,
             onedrive_default_path=ONEDRIVE_IMPORT_DIR,
@@ -971,7 +1639,6 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             CATEGORY_ITEMS_TEMPLATE,
             category=category,
             year=year,
-            month=month,
             month_name=month_name,
             items=items,
             total_amount=total_amount,
@@ -985,12 +1652,12 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         upload_files = [f for f in request.files.getlist("image") if f and f.filename]
         manual_entry = request.form.get("manual") == "on"
 
-        # Ograničenje: max 10 datoteka odjednom
+        # Ograničenje: max MAX_UPLOAD_FILES datoteka odjednom
         if upload_files and len(upload_files) > MAX_UPLOAD_FILES:
             return redirect(
                 url_for(
                     "index",
-                    error=f"Maksimalno je dopušteno učitati 10 datoteka odjednom (pokušali ste {len(upload_files)}).",
+                    error=f"Maksimalno je dopušteno učitati {MAX_UPLOAD_FILES} datoteka odjednom (pokušali ste {len(upload_files)}).",
                 )
             )
 
@@ -1000,10 +1667,8 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         upload_lang = default_lang
         upload_model = default_model
 
-        upload_dir = os.path.join(os.getcwd(), UPLOAD_DIR)
+        upload_dir = UPLOAD_DIR
         os.makedirs(upload_dir, exist_ok=True)
-
-        processed_entries = []
 
         # --- Ručni unos bez slike ---
         if manual_entry and not upload_files:
@@ -1025,7 +1690,6 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
                 items=[],
                 saved=False,
                 is_new=True,
-                json_path=os.path.join(upload_dir, f"manual_{int(datetime.now().timestamp())}_parsed.json"),
                 image_path=manual_identifier,
                 preview_image_path="",
                 base_payload=empty_payload,
@@ -1059,51 +1723,13 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             upload_file.save(temp_path)
             upload_jobs.append((temp_path, None))
 
-        try:
-            processed_entries = process_images_batch(upload_jobs, upload_lang)
-        except Exception as exc:
-            log_progress(f"Greška pri obradi upload datoteka: {exc}")
-            return redirect(url_for("index", error=f"Greška pri obradi upload datoteka: {exc}"))
-
-        if not processed_entries:
-            return redirect(url_for("index"))
-
-        first_entry = processed_entries[0]
-        pending_entries = processed_entries[1:]
-
-        first_rotate_target = (
-            first_entry["preview_path"]
-            if first_entry["preview_path"] and not first_entry["preview_path"].startswith("manual://")
-            else None
-        )
-        preview_image_path = first_entry["preview_path"]
-        preview_image_mtime = None
-        if preview_image_path and os.path.exists(preview_image_path):
-            preview_image_mtime = int(os.path.getmtime(preview_image_path))
-
-        return render_template_string(
-            DETAIL_TEMPLATE,
-            receipt={"id": None, "image_path": first_entry["image_path"]},
-            data=first_entry["payload"],
-            items=first_entry["payload"]["items"],
-            saved=False,
-            is_new=True,
-            json_path=first_entry["json_path"],
-            image_path=first_entry["image_path"],
-            preview_image_path=preview_image_path,
-            preview_image_mtime=preview_image_mtime,
-            base_payload=first_entry["payload"],
-            progress=first_entry["progress"],
-            default_lang=upload_lang,
-            default_model=upload_model,
-            pending_payloads=pending_entries,
-            pending_count=len(pending_entries),
-            rotate_target=first_rotate_target,
-            current_url=request.url,
-            format_date=_format_date_for_display,
-            form_error=None,
-            source_path=first_entry.get("source_path"),
-        )
+        batch_id = _create_batch(upload_jobs, upload_lang, upload_model, "spremljeno")
+        threading.Thread(
+            target=_run_batch_in_background,
+            args=(batch_id, upload_jobs, upload_lang),
+            daemon=True,
+        ).start()
+        return redirect(url_for("upload_batch_status", batch_id=batch_id))
 
     @app.route("/import_onedrive", methods=["POST"])
     def import_onedrive() -> str:
@@ -1154,7 +1780,7 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         # Poštuj ograničenje MAX_UPLOAD_FILES
         image_paths = all_files[:MAX_UPLOAD_FILES]
 
-        upload_dir = os.path.join(os.getcwd(), UPLOAD_DIR)
+        upload_dir = UPLOAD_DIR
         os.makedirs(upload_dir, exist_ok=True)
 
         upload_jobs: List[tuple[str, Optional[str]]] = []
@@ -1173,58 +1799,62 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             shutil.copy2(src_path, temp_path)
             upload_jobs.append((temp_path, src_path))
 
-        try:
-            processed_entries = process_images_batch(upload_jobs, upload_lang)
-        except Exception as exc:
-            log_progress(f"Greška pri obradi OneDrive datoteka: {exc}")
-            return redirect(url_for("index", error=f"Greška pri obradi OneDrive datoteka: {exc}"))
+        batch_id = _create_batch(upload_jobs, upload_lang, upload_model, "kopirano")
+        threading.Thread(
+            target=_run_batch_in_background,
+            args=(batch_id, upload_jobs, upload_lang),
+            daemon=True,
+        ).start()
+        return redirect(url_for("upload_batch_status", batch_id=batch_id))
+
+    @app.route("/batch/<batch_id>", methods=["GET"])
+    def upload_batch_status(batch_id: str) -> str:
+        batch = _get_batch(batch_id)
+        if not batch:
+            return redirect(
+                url_for("index", error="Obrada nije pronađena (možda je istekla).")
+            )
+        return render_template_string(
+            BATCH_STATUS_TEMPLATE,
+            batch_id=batch_id,
+            files=batch["files"],
+            done=batch["status"] == "done",
+        )
+
+    @app.route("/batch/<batch_id>/status.json", methods=["GET"])
+    def upload_batch_status_json(batch_id: str):
+        batch = _get_batch(batch_id)
+        if not batch:
+            return jsonify({"error": "not_found"}), 404
+        return jsonify({"done": batch["status"] == "done", "files": batch["files"]})
+
+    @app.route("/batch/<batch_id>/review", methods=["GET"])
+    def upload_batch_review(batch_id: str) -> str:
+        batch = _get_batch(batch_id)
+        if not batch:
+            return redirect(
+                url_for("index", error="Obrada nije pronađena (možda je istekla).")
+            )
+        if batch["status"] != "done":
+            return redirect(url_for("upload_batch_status", batch_id=batch_id))
+
+        batch = _pop_batch(batch_id) or batch
+        processed_entries = batch["processed_entries"] or []
+        batch_errors = batch["batch_errors"] or []
 
         if not processed_entries:
-            return redirect(url_for("index"))
+            error_msg = batch_failure_message(
+                batch_errors, len(batch["files"]), batch["stored_verb"]
+            )
+            return redirect(url_for("index", error=error_msg))
 
-        first_entry = processed_entries[0]
-        pending_entries = processed_entries[1:]
-
-        first_rotate_target = (
-            first_entry["preview_path"]
-            if first_entry["preview_path"] and not first_entry["preview_path"].startswith("manual://")
-            else None
+        return render_review_page(
+            processed_entries, batch_errors, batch["lang"], batch["model"]
         )
-        preview_image_path = first_entry["preview_path"]
-        preview_image_mtime = None
-        if preview_image_path and os.path.exists(preview_image_path):
-            preview_image_mtime = int(os.path.getmtime(preview_image_path))
-
-        return render_template_string(
-            DETAIL_TEMPLATE,
-            receipt={"id": None, "image_path": first_entry["image_path"]},
-            data=first_entry["payload"],
-            items=first_entry["payload"]["items"],
-            saved=False,
-            is_new=True,
-            json_path=first_entry["json_path"],
-            image_path=first_entry["image_path"],
-            preview_image_path=preview_image_path,
-            preview_image_mtime=preview_image_mtime,
-            base_payload=first_entry["payload"],
-            progress=first_entry["progress"],
-            default_lang=upload_lang,
-            default_model=upload_model,
-            pending_payloads=pending_entries,
-            pending_count=len(pending_entries),
-            rotate_target=first_rotate_target,
-            current_url=request.url,
-            format_date=_format_date_for_display,
-            form_error=None,
-            source_path=first_entry.get("source_path"),
-        )
-
-
 
     @app.route("/receipt/save_new", methods=["POST"])
     def save_new_receipt() -> str:
         image_path = request.form.get("image_path") or ""
-        json_path = request.form.get("json_path") or (os.path.splitext(image_path or "receipt.png")[0] + "_parsed.json")
         base_payload_raw = request.form.get("base_payload")
         pending_payloads_raw = request.form.get("pending_payloads", "[]")
         if not base_payload_raw:
@@ -1259,7 +1889,6 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
                 items=items,
                 saved=False,
                 is_new=True,
-                json_path=json_path,
                 image_path=image_path,
                 preview_image_path=preview_image_path,
                 preview_image_mtime=preview_image_mtime,
@@ -1276,10 +1905,9 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
                 source_path=request.form.get("source_path") or "",
             )
 
-        # --- Ako je sve u redu, spremi u JSON i DB ---
-        write_receipt_json_payload(updated_payload, json_path)
+        # --- Ako je sve u redu, spremi u DB ---
         receipt_obj = receipt_from_payload(updated_payload)
-        save_receipt_to_db(receipt_obj, json_path, db_path)
+        save_receipt_to_db(receipt_obj, db_path)
 
         # Ako je ovaj račun uvezen iz OneDrive-a i sad je uspješno spremljen,
         # obriši originalnu datoteku (source_path) iz OneDrive foldera.
@@ -1310,7 +1938,6 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
                 items=next_entry["payload"]["items"],
                 saved=False,
                 is_new=True,
-                json_path=next_entry["json_path"],
                 image_path=next_entry["image_path"],
                 preview_image_path=preview_image_path,
                 preview_image_mtime=preview_image_mtime,
@@ -1350,7 +1977,7 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         unique_suffix = f"{int(datetime.now().timestamp() * 1000)}_{uuid4().hex[:6]}"
         filename = f"receipt_{receipt_id}_{unique_suffix}{ext}"
 
-        upload_dir = os.path.join(os.getcwd(), UPLOAD_DIR)
+        upload_dir = UPLOAD_DIR
         os.makedirs(upload_dir, exist_ok=True)
         saved_path = os.path.join(upload_dir, filename)
         upload_file.save(saved_path)
@@ -1361,22 +1988,15 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
 
         abs_path = os.path.abspath(saved_path)
 
-        data = json.loads(row["data_json"])
-        data["image"] = abs_path
-
         conn = get_db_connection(db_path)
         try:
             conn.execute(
-                "UPDATE receipts SET image_path = ?, data_json = ?, updated_at = ? WHERE id = ?",
-                (abs_path, json.dumps(data, ensure_ascii=False), datetime.now().isoformat(timespec="seconds"), receipt_id),
+                "UPDATE receipts SET image_path = ?, updated_at = ? WHERE id = ?",
+                (abs_path, datetime.now().isoformat(timespec="seconds"), receipt_id),
             )
             conn.commit()
         finally:
             conn.close()
-
-        json_path = row["json_path"]
-        if json_path:
-            write_receipt_json_payload(data, json_path)
 
         return redirect(url_for("receipt_detail", receipt_id=receipt_id, saved=1))
 
@@ -1396,7 +2016,7 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         if not path:
             abort(404)
         abs_path = os.path.abspath(path)
-        upload_dir = os.path.abspath(os.path.join(os.getcwd(), UPLOAD_DIR))
+        upload_dir = os.path.abspath(UPLOAD_DIR)
         if not abs_path.startswith(upload_dir):
             abort(403)
         if not os.path.exists(abs_path):
@@ -1412,7 +2032,7 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
                 return redirect(url_for("index"))
 
             abs_path = os.path.abspath(path)
-            uploads_dir = os.path.abspath(os.path.join(os.getcwd(), UPLOAD_DIR))
+            uploads_dir = os.path.abspath(UPLOAD_DIR)
             if not os.path.exists(abs_path) or not abs_path.startswith(uploads_dir):
                 return redirect(url_for("index"))
 
@@ -1422,9 +2042,6 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
 
             # Rebuild context for DETAIL_TEMPLATE
             image_path = request.form.get("image_path") or path
-            json_path = request.form.get("json_path") or (
-                os.path.splitext(image_path or "receipt.png")[0] + "_parsed.json"
-            )
             preview_image_path = request.form.get("preview_image_path") or image_path
 
             base_payload_raw = request.form.get("base_payload") or "{}"
@@ -1443,8 +2060,8 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
 
             items = base_payload.get("items", [])
 
-            default_lang = request.form.get("default_lang") or default_lang
-            default_model = request.form.get("default_model") or default_model
+            resolved_lang = request.form.get("default_lang") or default_lang
+            resolved_model = request.form.get("default_model") or default_model
 
             preview_image_mtime = None
             if preview_image_path and os.path.exists(preview_image_path):
@@ -1463,14 +2080,13 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
                 items=items,
                 saved=False,
                 is_new=True,
-                json_path=json_path,
                 image_path=image_path,
                 preview_image_path=preview_image_path,
                 preview_image_mtime=preview_image_mtime,
                 base_payload=base_payload,
                 progress=[],
-                default_lang=default_lang,
-                default_model=default_model,
+                default_lang=resolved_lang,
+                default_model=resolved_model,
                 pending_payloads=pending_payloads,
                 pending_count=len(pending_payloads),
                 rotate_target=rotate_target,
@@ -1490,7 +2106,7 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             return redirect(next_url or fallback)
 
         abs_path = os.path.abspath(path)
-        uploads_dir = os.path.abspath(os.path.join(os.getcwd(), UPLOAD_DIR))
+        uploads_dir = os.path.abspath(UPLOAD_DIR)
         if not os.path.exists(abs_path) or not abs_path.startswith(uploads_dir):
             return redirect(next_url or fallback)
 
@@ -1508,8 +2124,7 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         row = fetch_receipt_record(receipt_id, db_path)
         if row is None:
             abort(404)
-        data = json.loads(row["data_json"])
-        data.setdefault("warranty", bool(row["warranty"]))
+        data = fetch_receipt_payload(row, db_path)
         items = data.get("items", [])
         rotate_target = row["image_path"] if row["image_path"] and not row["image_path"].startswith("manual://") else None
 
@@ -1533,7 +2148,6 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
                     saved=False,
                     is_new=False,
                     progress=[],
-                    json_path=row["json_path"],
                     image_path=row["image_path"],
                     preview_image_path=preview_image_path,
                     preview_image_mtime=preview_image_mtime,
@@ -1549,7 +2163,6 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
                 )
 
             update_receipt_record(receipt_id, updated_payload, db_path)
-            write_receipt_json_payload(updated_payload, row["json_path"])
             return redirect(url_for("receipt_detail", receipt_id=receipt_id, saved=1))
 
 
@@ -1567,7 +2180,6 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             saved=saved_flag,
             is_new=False,
             progress=[],
-            json_path=row["json_path"],
             image_path=row["image_path"],
             preview_image_path=preview_image_path,
             preview_image_mtime=preview_image_mtime,
@@ -1585,124 +2197,213 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
     return app
 
 
-INDEX_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="hr">
-  <head>
-    <meta charset="utf-8" />
-    <title>Billing me softly</title>
-<style>
+FONT_LINKS = """
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />"""
+
+# Zajednički dizajn-tokeni i bazni stilovi za sva tri Jinja2 templatea.
+# Tema "Ledger & Ink": papir/knjigovodstvena traka (greenbar zebra tablice) +
+# crveni "pečat" akcenti na primarnim akcijama + poderani rub na masthead traci,
+# kao referenca na fizičku traku papirnatog računa koju aplikacija digitalizira.
+BASE_STYLE = """
   :root {
-    --color-bg: #F4F7FB;
-    --color-card: #FFFFFF;
-    --color-border: #D6DFEA;
-    --color-text: #111827;
-    --color-text-muted: #6B7280;
+    --paper: #F2F4EC;
+    --paper-card: #FFFFFF;
+    --ink: #1C2620;
+    --ink-soft: #4B564A;
+    --stamp: #B23A2E;
+    --stamp-dark: #8C2C22;
+    --ledger-stripe: #E6EFDF;
+    --ledger-stripe-hover: #D8E6D2;
+    --border: #C9D2C2;
+    --success: #2F6B3A;
 
-    --color-primary: #12324A;
-    --color-primary-light: #1F4F7F;
-    --color-primary-soft: #E3EDF7;
-
-    --color-success: #137333;
-    --color-danger: #B00020;
+    --font-display: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+    --font-body: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
   }
 
-  * {
-    box-sizing: border-box;
-  }
+  * { box-sizing: border-box; }
 
   body {
     margin: 0;
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: var(--color-bg);
-    color: var(--color-text);
+    font-family: var(--font-body);
+    background: var(--paper);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
   }
 
   .page {
     max-width: 2000px;
     margin: 0 auto;
-    padding: 1.5rem 1.5rem 3rem;
+    padding: 2.25rem 1.75rem 3.5rem;
   }
 
+  /* --- Masthead: stilizirano kao vrh papirnatog računa, s poderanim rubom --- */
   .topbar {
-    background: var(--color-primary);
-    color: #fff;
-    padding: 0.75rem 1.5rem;
+    position: relative;
+    background: var(--ink);
+    color: var(--paper);
+    padding: 1.1rem 1.75rem 1.6rem;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .topbar::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -9px;
+    height: 9px;
+    background-image:
+      linear-gradient(135deg, var(--ink) 50%, transparent 50%),
+      linear-gradient(45deg, var(--ink) 50%, transparent 50%);
+    background-size: 18px 18px, 18px 18px;
+    background-position: 0 0, 9px 0;
+    background-repeat: repeat-x;
   }
 
   .topbar-title {
+    font-family: var(--font-display);
     font-weight: 600;
-    letter-spacing: 0.03em;
+    font-size: 1.05rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
   }
 
   .topbar-subtitle {
-    font-size: 0.85rem;
-    opacity: 0.85;
+    font-family: var(--font-display);
+    font-size: 0.75rem;
+    letter-spacing: 0.05em;
+    color: var(--ledger-stripe);
+    opacity: 0.8;
+    margin-top: 0.2rem;
   }
+
+  .topbar-barcode {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 20px;
+    margin-top: 0.4rem;
+    opacity: 0.55;
+  }
+
+  .topbar-barcode span {
+    display: block;
+    width: 2px;
+    height: 100%;
+    background: var(--paper);
+  }
+
+  .topbar-barcode span:nth-child(3n) { width: 3px; }
+  .topbar-barcode span:nth-child(5n) { height: 65%; }
+  .topbar-barcode span:nth-child(7n) { height: 45%; }
 
   .topbar-actions {
     display: flex;
-    gap: 0.5rem;
+    gap: 0.6rem;
     align-items: center;
   }
 
-  .pill {
-    padding: 0.25rem 0.75rem;
-    border-radius: 9999px;
-    background: rgba(255,255,255,0.1);
-    font-size: 0.75rem;
-  }
-
+  /* --- Gumbi: potpisni "pečat" element na primarnim akcijama --- */
   a.button,
   button.button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 0.5rem 1.1rem;
-    background: var(--color-primary);
-    color: #fff;
-    border-radius: 9999px;
-    border: none;
-    font-size: 0.9rem;
+    gap: 0.35rem;
+    padding: 0.5rem 1rem;
+    font-family: var(--font-display);
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    border-radius: 3px;
+    border: 1.5px solid transparent;
     cursor: pointer;
     text-decoration: none;
-    transition: background 0.15s ease, transform 0.05s ease;
+    transition: transform 0.1s ease, background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
   }
 
-  a.button:hover,
-  button.button:hover {
-    background: var(--color-primary-light);
-    transform: translateY(-1px);
+  .button-onbar {
+    color: var(--paper);
+    border-color: rgba(255, 255, 255, 0.55);
+    background: transparent;
+  }
+  .button-onbar:hover {
+    background: rgba(255, 255, 255, 0.14);
+    border-color: var(--paper);
   }
 
-  a.button:active,
-  button.button:active {
-    transform: translateY(0);
+  .button-primary {
+    color: var(--stamp);
+    border-color: var(--stamp);
+    background: var(--paper-card);
+    transform: rotate(-1deg);
+  }
+  .button-primary:hover {
+    background: var(--stamp);
+    color: var(--paper-card);
+  }
+  .button-primary:active {
+    transform: rotate(-1deg) translateY(1px);
+  }
+
+  .button-secondary {
+    color: var(--ink-soft);
+    border-color: var(--border);
+    background: var(--paper-card);
+  }
+  .button-secondary:hover {
+    border-color: var(--ink-soft);
+    color: var(--ink);
+    background: var(--paper);
+  }
+
+  a.button:focus-visible,
+  button.button:focus-visible,
+  input:focus-visible,
+  select:focus-visible {
+    outline: 2px solid var(--stamp);
+    outline-offset: 1px;
   }
 
   h1, h2, h3 {
-    margin: 1.5rem 0 0.75rem;
-    color: var(--color-primary);
+    font-family: var(--font-display);
+    color: var(--ink);
+    margin: 1.6rem 0 0.8rem;
+    font-weight: 600;
+  }
+
+  h1 {
+    font-size: 1.25rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
   }
 
   .card {
-    background: var(--color-card);
-    border-radius: 12px;
-    border: 1px solid var(--color-border);
-    padding: 1rem 1.25rem;
-    margin-top: 1rem;
-    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.04);
+    background: var(--paper-card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1.1rem 1.3rem;
+    margin-top: 1.25rem;
   }
 
   .card-header {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    margin-bottom: 0.75rem;
+    margin-bottom: 0.8rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px dashed var(--border);
   }
 
   .card-header h2,
@@ -1711,22 +2412,51 @@ INDEX_TEMPLATE = """
   }
 
   .card-header small {
-    color: var(--color-text-muted);
+    font-family: var(--font-display);
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
   }
 
   .alert {
-    margin-top: 1rem;
-    border-radius: 10px;
-    padding: 0.85rem 1rem;
-    border: 1px solid #F5C2C7;
-    background: #F8D7DA;
-    color: #842029;
-    font-size: 0.9rem;
+    margin-top: 1.1rem;
+    border-radius: 3px;
+    padding: 0.8rem 1rem;
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--ink-soft);
+    background: var(--paper-card);
+    font-size: 0.88rem;
+    color: var(--ink);
   }
 
-  form {
-    margin: 0;
+  .alert-error {
+    border-left-color: var(--stamp);
+    color: var(--stamp-dark);
   }
+
+  .alert-success {
+    border-left-color: var(--success);
+    color: var(--success);
+  }
+
+  .alert-info {
+    border-left-color: var(--ink-soft);
+    color: var(--ink-soft);
+  }
+
+  .panel-form {
+    margin-top: 1.1rem;
+    background: var(--paper-card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1rem 1.2rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.85rem 1.1rem;
+  }
+
+  form { margin: 0; }
 
   form .form-row {
     display: flex;
@@ -1736,88 +2466,122 @@ INDEX_TEMPLATE = """
   }
 
   label {
-    font-size: 0.85rem;
-    color: var(--color-text-muted);
+    font-family: var(--font-display);
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: 0.3rem;
   }
 
   input[type="text"],
+  input[type="number"],
   input[type="file"],
   select {
-    border-radius: 10px;
-    border: 1px solid var(--color-border);
-    padding: 0.4rem 0.6rem;
-    font-size: 0.9rem;
-    background: #fff;
+    border-radius: 2px;
+    border: 1px solid var(--border);
+    padding: 0.42rem 0.55rem;
+    font-size: 0.88rem;
+    font-family: var(--font-body);
+    background: var(--paper-card);
+    color: var(--ink);
   }
 
   input[type="checkbox"] {
-    margin-right: 0.25rem;
+    margin-right: 0.3rem;
+  }
+
+  .label-checkbox {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .cell-link {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  pre {
+    font-family: var(--font-display);
+    font-size: 0.78rem;
+    background: var(--paper);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0.6rem 0.75rem;
   }
 
   table {
     width: 100%;
     border-collapse: collapse;
-    margin-top: 0.5rem;
-    background: var(--color-card);
+    margin-top: 0.6rem;
+    background: var(--paper-card);
   }
 
   th, td {
-    padding: 0.45rem 0.5rem;
+    padding: 0.5rem 0.6rem;
     text-align: left;
-    border-bottom: 1px solid #EAECF0;
-    font-size: 0.85rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.84rem;
   }
 
   th {
-    background: var(--color-primary-soft);
+    background: var(--ink);
+    color: var(--paper);
+    font-family: var(--font-display);
     font-weight: 600;
-    color: var(--color-primary);
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
   }
 
-  tr:nth-child(even) td {
-    background: #FAFCFF;
+  th a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  tbody tr:nth-child(even) td {
+    background: var(--ledger-stripe);
   }
 
   tbody tr:hover td {
-    background: #E9F2FD;
+    background: var(--ledger-stripe-hover);
   }
 
   .warranty-pill {
     display: inline-block;
-    padding: 0.1rem 0.5rem;
-    border-radius: 9999px;
-    font-size: 0.75rem;
-    font-weight: 500;
+    padding: 0.05rem 0.4rem;
+    border: 1px solid currentColor;
+    border-radius: 2px;
+    font-family: var(--font-display);
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
   }
 
-  .warranty-yes {
-    background: #E6F4EA;
-    color: var(--color-success);
-  }
-
-  .warranty-no {
-    background: #E5E7EB;
-    color: var(--color-text-muted);
-  }
+  .warranty-yes { color: var(--success); }
+  .warranty-no { color: var(--ink-soft); opacity: 0.7; }
 
   .amount-cell {
     text-align: right;
     font-variant-numeric: tabular-nums;
+    font-family: var(--font-display);
   }
 
-  .amount-header {
-    text-align: right;
-  }
+  .amount-header { text-align: right; }
 
   .empty {
     margin-top: 2rem;
-    font-style: italic;
-    color: var(--color-text-muted);
+    font-family: var(--font-display);
+    font-size: 0.85rem;
+    color: var(--ink-soft);
   }
 
+  .small-text {
+    font-size: 0.8rem;
+    color: var(--ink-soft);
+  }
 
   .filters-inline {
     display: flex;
@@ -1829,74 +2593,195 @@ INDEX_TEMPLATE = """
     min-width: 150px;
   }
 
-  .small-text {
-    font-size: 0.8rem;
-    color: var(--color-text-muted);
+  /* --- Date picker: "Ledger Stamp Grid" kalendar helper za polja datuma --- */
+  .date-field {
+    position: relative;
+  }
+
+  .date-field-row {
+    display: inline-flex;
+    gap: 0.4rem;
+  }
+
+  .date-picker-toggle {
+    padding: 0.42rem 0.55rem;
+    line-height: 1;
+  }
+
+  .date-picker-popup {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    z-index: 30;
+    width: 272px;
+    background: var(--paper-card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    box-shadow: 0 8px 20px rgba(28, 38, 32, 0.18);
+    overflow: hidden;
+  }
+
+  .date-picker-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--ink);
+    color: var(--paper);
+    padding: 0.5rem 0.6rem;
+    font-family: var(--font-display);
+    font-size: 0.76rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+  }
+
+  .date-picker-nav {
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    color: var(--paper);
+    border: 1px solid rgba(255, 255, 255, 0.55);
+    border-radius: 2px;
+    font-family: var(--font-display);
+    cursor: pointer;
+  }
+
+  .date-picker-nav:hover {
+    background: rgba(255, 255, 255, 0.14);
+    border-color: var(--paper);
+  }
+
+  .date-picker-weekdays {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    background: var(--ledger-stripe);
+    padding: 0.35rem 0;
+    font-family: var(--font-display);
+    font-size: 0.6rem;
+    letter-spacing: 0.03em;
+    text-align: center;
+    color: var(--ink-soft);
+  }
+
+  .date-picker-week {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+  }
+
+  .date-picker-week:nth-child(even) {
+    background: var(--ledger-stripe);
+  }
+
+  .date-picker-day {
+    border: none;
+    background: transparent;
+    padding: 0.42rem 0;
+    font-family: var(--font-display);
+    font-size: 0.78rem;
+    color: var(--ink);
+    cursor: pointer;
+    position: relative;
+  }
+
+  .date-picker-day:hover:not(:disabled) {
+    background: var(--ledger-stripe-hover);
+  }
+
+  .date-picker-day-outside {
+    color: var(--border);
+  }
+
+  .date-picker-day:disabled {
+    color: var(--border);
+    cursor: not-allowed;
+  }
+
+  .date-picker-day-today {
+    font-weight: 600;
+  }
+
+  .date-picker-day-selected {
+    color: var(--stamp-dark);
+    font-weight: 700;
+  }
+
+  .date-picker-day-selected::after {
+    content: "";
+    position: absolute;
+    inset: 2px 8px;
+    border: 1.5px solid var(--stamp);
+    border-radius: 50%;
+    transform: rotate(-6deg);
+    pointer-events: none;
   }
 
   @media (max-width: 768px) {
-    .page {
-      padding: 1rem;
-    }
-    .topbar {
-      flex-direction: column;
-      align-items: flex-start;
-      gap: 0.35rem;
-    }
-    .filters-inline label {
-      width: 100%;
-    }
-    table {
-      font-size: 0.8rem;
-      display: block;
-      overflow-x: auto;
-      white-space: nowrap;
-    }
+    .page { padding: 1.25rem; }
+    .topbar { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+    .filters-inline label { width: 100%; }
+    table { font-size: 0.8rem; display: block; overflow-x: auto; white-space: nowrap; }
+    .date-picker-popup { width: calc(100vw - 2.5rem); }
   }
-</style>
+"""
 
+
+INDEX_TEMPLATE = (
+    """
+<!DOCTYPE html>
+<html lang="hr">
+  <head>
+    <meta charset="utf-8" />
+    <title>Billing me softly</title>"""
+    + FONT_LINKS
+    + """
+<style>"""
+    + BASE_STYLE
+    + """
+</style>
   </head>
   <body>
     <div class="topbar">
       <div>
         <div class="topbar-title">Billing me softly</div>
+        <div class="topbar-subtitle">Evidencija troškova</div>
+        <div class="topbar-barcode">{% for _ in range(28) %}<span></span>{% endfor %}</div>
       </div>
       <div class="topbar-actions">
-        <a class="button" href="/">Osvježi</a>
+        <a class="button button-onbar" href="/">Osvježi</a>
       </div>
     </div>
     <div class="page">
     {% if error_message %}
-      <div class="alert" style="margin-top:1rem; background:#f8d7da; color:#721c24; padding:0.8rem; border:1px solid #f5c6cb; border-radius:4px;">
+      <div class="alert alert-error">
         Dogodila se greška: {{ error_message }}
       </div>
     {% endif %}
     {% if progress %}
-      <div class="panel" style="margin-top:1rem;">
+      <div class="card" style="margin-top:1rem;">
         <h3>Koraci obrade</h3>
         <pre style="max-height:200px; overflow:auto;">{% for line in progress %}{{ line }}&#10;{% endfor %}</pre>
       </div>
     {% endif %}
-    <form action="{{ url_for('upload_receipt') }}" method="post" enctype="multipart/form-data"
-          style="margin-top:1rem; background:#fff; padding:1rem; border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.1); display:flex; flex-wrap:wrap; gap:1rem;">
-      <label style="align-self:center;">Učitaj jednu ili više (max 10) fotografija računa (PNG/JPG):</label>
+    <form action="{{ url_for('upload_receipt') }}" method="post" enctype="multipart/form-data" class="panel-form">
+      <label style="align-self:center;">Učitaj jednu ili više (max {{ onedrive_import_limit }}) fotografija računa (PNG/JPG):</label>
       <input type="file" name="image" accept="image/*" multiple />
       <label style="align-self:center;">
         <input type="checkbox" name="manual" /> Ručni unos bez slike
       </label>
-      <button class="button" type="submit">Start</button>
+      <button class="button button-primary" type="submit">Start</button>
     </form>
-    <form action="{{ url_for('import_onedrive') }}" method="post"
-          style="margin-top:1rem; background:#fff; padding:1rem; border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.1); display:flex; flex-wrap:wrap; gap:1rem;">
-      <label style="align-self:center;">Učitaj slike računa iz OneDrive foldera:</label>
+    <form action="{{ url_for('import_onedrive') }}" method="post" class="panel-form">
+      <label style="align-self:center;">Učitaj slike računa iz foldera:</label>
       <input type="text" name="onedrive_path" value="{{ onedrive_default_path or '' }}"
              placeholder="npr. /home/ituda/OneDrive/Racuni" style="flex:1;" />
-      <button class="button" type="submit">Uvezi iz OneDrive</button>
-      <p style="font-size:0.85rem; color:#555; flex-basis:100%;">
+      <button class="button button-primary" type="submit">Uvezi</button>
+      <p class="small-text" style="flex-basis:100%; margin:0;">
         Učitava maksimalno {{ onedrive_import_limit }} slikovnih datoteka (.png, .jpg, .jpeg, .webp, .heic, .tif, .tiff) iz zadane putanje po jednom kliku.
       </p>
       {% if onedrive_default_path and onedrive_total_files is not none %}
-        <p style="font-size:0.85rem; color:#333; flex-basis:100%;">
+        <p class="small-text" style="flex-basis:100%; margin:0;">
           Trenutno u folderu <code>{{ onedrive_default_path }}</code> ima
           <strong>{{ onedrive_total_files }}</strong> slikovnih datoteka.
           To znači da će biti potrebno
@@ -1908,7 +2793,7 @@ INDEX_TEMPLATE = """
     </form>
 
     {% if category_summary %}
-      <h2 id="categories-section">Pregled po kategorijama
+      <h2 id="categories-section">Pregled kategorija po godini
         {% if available_years and available_years|length > 1 %}
           <form method="get"
                 action="{{ url_for('index') }}#categories-section"
@@ -1945,7 +2830,7 @@ INDEX_TEMPLATE = """
                             category=category,
                             year=current_year,
                             month=loop.index) }}"
-                style="text-decoration:none; color:inherit;">
+                class="cell-link">
                 {{ ("%.2f"|format(value)).replace(".", ",") }}
                 </a>
               </td>
@@ -1976,7 +2861,7 @@ INDEX_TEMPLATE = """
 
     <form method="get"
         action="{{ url_for('index') }}#receipts-list"
-        style="margin-top:1rem; background:#fff; padding:1rem; border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.1); display:flex; flex-wrap:wrap; gap:1rem;">
+        class="panel-form">
       <input type="hidden" name="sort" value="{{ sort_by }}" />
       <input type="hidden" name="dir" value="{{ direction }}" />
       {% if available_years and available_years|length > 0 %}
@@ -1996,6 +2881,9 @@ INDEX_TEMPLATE = """
         <input type="text" name="total_max"
                value="{{ ('%.2f'|format(filters.total_max)).replace('.', ',') if filters.total_max is not none else '' }}" />
       </label>
+      <label>Pretraži stavke:
+        <input type="text" name="item_search" value="{{ filters.item_search or '' }}" placeholder="npr. šunka, mlijeko..." />
+      </label>
       <label>Garancija:
         <select name="warranty_filter">
           <option value="" {% if not filters.warranty %}selected{% endif %}>Sve</option>
@@ -2013,8 +2901,8 @@ INDEX_TEMPLATE = """
         </select>
       </label>
       <div style="display:flex; gap:0.5rem;">
-        <button class="button" type="submit">Primijeni filtere</button>
-        <a class="button" href="/" style="background:#6c757d;">Resetiraj</a>
+        <button class="button button-primary" type="submit">Primijeni filtere</button>
+        <a class="button button-secondary" href="/">Resetiraj</a>
       </div>
     </form>
     {% if receipts %}
@@ -2025,7 +2913,7 @@ INDEX_TEMPLATE = """
             <th><a href="{{ url_for('index', sort='image_path', dir='asc' if sort_by != 'image_path' or direction == 'desc' else 'desc') }}">Slika</a></th>
             <th><a href="{{ url_for('index', sort='date', dir='asc' if sort_by != 'date' or direction == 'desc' else 'desc') }}">Datum</a></th>
             <th><a href="{{ url_for('index', sort='time', dir='asc' if sort_by != 'time' or direction == 'desc' else 'desc') }}">Vrijeme</a></th>
-            <th class="amount-header"> 
+            <th class="amount-header">
               <a href="{{ url_for('index', sort='total', dir='asc' if sort_by != 'total' or direction == 'desc' else 'desc') }}">
                 Ukupno (€)
               </a>
@@ -2046,8 +2934,14 @@ INDEX_TEMPLATE = """
               {{ ("%.2f"|format(receipt.total)).replace(".", ",") if receipt.total is not none else "—" }}
             </td>
             <td>{{ receipt.updated_at }}</td>
-            <td>{{ "Da" if receipt.warranty else "Ne" }}</td>
-            <td><a class="button" href="{{ url_for('receipt_detail', receipt_id=receipt.id) }}">Uredi</a></td>
+            <td>
+              {% if receipt.warranty %}
+                <span class="warranty-pill warranty-yes">Da</span>
+              {% else %}
+                <span class="warranty-pill warranty-no">Ne</span>
+              {% endif %}
+            </td>
+            <td><a class="button button-primary" href="{{ url_for('receipt_detail', receipt_id=receipt.id) }}">Uredi</a></td>
           </tr>
           {% endfor %}
         </tbody>
@@ -2059,108 +2953,22 @@ INDEX_TEMPLATE = """
   </body>
 </html>
 """
+)
 
 
-DETAIL_TEMPLATE = """
+
+DETAIL_TEMPLATE = (
+    """
 <!DOCTYPE html>
 <html lang="hr">
   <head>
     <meta charset="utf-8" />
-    <title>Račun {{ receipt.id if receipt and receipt.id else 'Novi račun' }}</title>
-    <style>
-      :root {
-        --color-bg: #F4F7FB;
-        --color-card: #FFFFFF;
-        --color-border: #D6DFEA;
-        --color-text: #111827;
-        --color-text-muted: #6B7280;
-
-        --color-primary: #12324A;
-        --color-primary-light: #1F4F7F;
-        --color-primary-soft: #E3EDF7;
-
-        --color-success: #137333;
-        --color-danger: #B00020;
-      }
-
-      * {
-        box-sizing: border-box;
-      }
-
-      body {
-        margin: 0;
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: var(--color-bg);
-        color: var(--color-text);
-      }
-
-      .topbar {
-        background: var(--color-primary);
-        color: #fff;
-        padding: 0.75rem 1.5rem;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.15);
-      }
-
-      .topbar-title {
-        font-weight: 600;
-        letter-spacing: 0.03em;
-      }
-
-      .topbar-subtitle {
-        font-size: 0.85rem;
-        opacity: 0.85;
-      }
-
-      .topbar-actions {
-        display: flex;
-        gap: 0.5rem;
-        align-items: center;
-      }
-
-      .page {
-        max-width: 2000px;
-        margin: 0 auto;
-        padding: 1.5rem 1.5rem 3rem;
-      }
-
-      h1, h2, h3 {
-        color: var(--color-primary);
-        margin-top: 0;
-      }
-
-      h1 {
-        margin-bottom: 1rem;
-        font-size: 1.4rem;
-      }
-
-      .card {
-        background: var(--color-card);
-        border-radius: 12px;
-        border: 1px solid var(--color-border);
-        padding: 1rem 1.25rem 1.25rem;
-        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.04);
-      }
-
-      .card-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: baseline;
-        margin-bottom: 0.75rem;
-      }
-
-      .card-header h2 {
-        margin: 0;
-        font-size: 1.1rem;
-      }
-
-      .card-header small {
-        color: var(--color-text-muted);
-        font-size: 0.8rem;
-      }
-
+    <title>Račun {{ receipt.id if receipt and receipt.id else 'Novi račun' }}</title>"""
+    + FONT_LINKS
+    + """
+    <style>"""
+    + BASE_STYLE
+    + """
       .detail-layout {
         display: flex;
         gap: 1.5rem;
@@ -2184,134 +2992,9 @@ DETAIL_TEMPLATE = """
         height: auto;
         max-height: 100vh;
         object-fit: contain;
-        border-radius: 8px;
-        border: 1px solid var(--color-border);
-        background: #f9fafb;
-      }
-
-      .small-text {
-        font-size: 0.8rem;
-        color: var(--color-text-muted);
-      }
-
-      .alert {
-        margin-top: 1rem;
-        border-radius: 10px;
-        padding: 0.85rem 1rem;
-        font-size: 0.9rem;
-      }
-
-      .alert-error {
-        border: 1px solid #F5C2C7;
-        background: #F8D7DA;
-        color: #842029;
-      }
-
-      .alert-success {
-        border: 1px solid #C3E6CB;
-        background: #D4EDDA;
-        color: #155724;
-      }
-
-      .alert-info {
-        border: 1px solid #B3B7FF;
-        background: #E2E3FF;
-        color: #14135E;
-      }
-
-      a.button,
-      button.button {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        padding: 0.5rem 1.1rem;
-        border-radius: 9999px;
-        border: none;
-        font-size: 0.9rem;
-        cursor: pointer;
-        text-decoration: none;
-        transition: background 0.15s ease, transform 0.05s ease, box-shadow 0.15s ease;
-        font-weight: 500;
-      }
-
-      a.button-primary,
-      button.button-primary {
-        background: var(--color-primary);
-        color: #fff;
-      }
-
-      a.button-secondary,
-      button.button-secondary {
-        background: #fff;
-        color: var(--color-primary);
-        border: 1px solid var(--color-primary-soft);
-      }
-
-      a.button:hover,
-      button.button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.15);
-      }
-
-      a.button:active,
-      button.button:active {
-        transform: translateY(0);
-        box-shadow: none;
-      }
-
-      form {
-        margin: 0;
-      }
-
-      label {
-        display: block;
-        font-size: 0.85rem;
-        color: var(--color-text-muted);
-        margin-top: 0.5rem;
-        margin-bottom: 0.15rem;
-      }
-
-      input[type="text"],
-      input[type="number"],
-      select {
-        width: 100%;
-        border-radius: 10px;
-        border: 1px solid var(--color-border);
-        padding: 0.35rem 0.5rem;
-        font-size: 0.9rem;
-        background: #fff;
-      }
-
-      input[type="checkbox"] {
-        margin-right: 0.35rem;
-      }
-
-      table {
-        width: 100%;
-        border-collapse: collapse;
-        margin-top: 0.5rem;
-        background: var(--color-card);
-      }
-
-      th, td {
-        padding: 0.35rem 0.45rem;
-        text-align: left;
-        border-bottom: 1px solid #EAECF0;
-        font-size: 0.8rem;
-      }
-
-      th {
-        background: var(--color-primary-soft);
-        font-weight: 600;
-        color: var(--color-primary);
-      }
-
-      tbody tr:nth-child(even) td {
-        background: #FAFCFF;
-      }
-
-      tbody tr:hover td {
-        background: #E9F2FD;
+        border-radius: 4px;
+        border: 1px solid var(--border);
+        background: var(--paper);
       }
 
       .actions {
@@ -2325,12 +3008,13 @@ DETAIL_TEMPLATE = """
         margin-top: 0.5rem;
         text-align: right;
         font-size: 0.85rem;
-        color: var(--color-text-muted);
+        font-family: var(--font-display);
+        color: var(--ink-soft);
       }
 
       #items-sum-label {
         font-weight: 600;
-        color: var(--color-primary);
+        color: var(--ink);
         margin-left: 0.25rem;
       }
 
@@ -2342,9 +3026,6 @@ DETAIL_TEMPLATE = """
       }
 
       @media (max-width: 900px) {
-        .page {
-          padding: 1rem;
-        }
         .detail-layout {
           flex-direction: column;
         }
@@ -2352,11 +3033,6 @@ DETAIL_TEMPLATE = """
         .detail-form-card {
           max-width: 100%;
           flex: 1 1 100%;
-        }
-        table {
-          display: block;
-          overflow-x: auto;
-          white-space: nowrap;
         }
       }
     </style>
@@ -2368,7 +3044,7 @@ DETAIL_TEMPLATE = """
         <div class="topbar-subtitle">Uređivanje računa</div>
       </div>
       <div class="topbar-actions">
-        <a class="button button-secondary" href="{{ url_for('index') }}">Natrag na popis</a>
+        <a class="button button-onbar" href="{{ url_for('index') }}">Natrag na popis</a>
       </div>
     </div>
 
@@ -2454,7 +3130,6 @@ DETAIL_TEMPLATE = """
                   class="rotate-group">
               <input type="hidden" name="path" value="{{ rotate_target }}" />
               <input type="hidden" name="image_path" value="{{ image_path }}" />
-              <input type="hidden" name="json_path" value="{{ json_path }}" />
               <input type="hidden" name="preview_image_path" value="{{ preview_image_path }}" />
               <input type="hidden" name="base_payload" value='{{ base_payload | tojson }}' />
               <input type="hidden" name="pending_payloads" value='{{ pending_payloads | tojson }}' />
@@ -2503,7 +3178,6 @@ DETAIL_TEMPLATE = """
                 action="{% if is_new %}{{ url_for('save_new_receipt') }}{% else %}{{ url_for('receipt_detail', receipt_id=receipt.id) }}{% endif %}">
             {% if is_new %}
               <input type="hidden" name="image_path" value="{{ image_path }}" />
-              <input type="hidden" name="json_path" value="{{ json_path }}" />
               <input type="hidden" name="base_payload" value='{{ base_payload | tojson }}' />
               <input type="hidden" name="pending_payloads" value='{{ pending_payloads | tojson }}' />
               <input type="hidden" name="preview_image_path" value="{{ preview_image_path }}" />
@@ -2511,10 +3185,39 @@ DETAIL_TEMPLATE = """
             {% endif %}
 
             <label>Datum:</label>
-            <input type="text"
-                   name="date"
-                   value="{{ format_date(data.date) }}"
-                   placeholder="npr. 01.03.2025" />
+            <div class="date-field" id="date-field">
+              <div class="date-field-row">
+                <input type="text"
+                       id="date-input"
+                       name="date"
+                       value="{{ format_date(data.date) }}"
+                       placeholder="npr. 01.03.2025"
+                       autocomplete="off" />
+                <button type="button"
+                        class="button button-secondary date-picker-toggle"
+                        id="date-picker-toggle"
+                        aria-label="Otvori kalendar">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                       stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="4" width="18" height="18" rx="2" />
+                    <line x1="16" y1="2" x2="16" y2="6" />
+                    <line x1="8" y1="2" x2="8" y2="6" />
+                    <line x1="3" y1="10" x2="21" y2="10" />
+                  </svg>
+                </button>
+              </div>
+              <div class="date-picker-popup" id="date-picker-popup" hidden>
+                <div class="date-picker-header">
+                  <button type="button" class="date-picker-nav" id="date-picker-prev" aria-label="Prethodni mjesec">‹</button>
+                  <span id="date-picker-title"></span>
+                  <button type="button" class="date-picker-nav" id="date-picker-next" aria-label="Sljedeći mjesec">›</button>
+                </div>
+                <div class="date-picker-weekdays">
+                  <span>PON</span><span>UTO</span><span>SRI</span><span>ČET</span><span>PET</span><span>SUB</span><span>NED</span>
+                </div>
+                <div class="date-picker-grid" id="date-picker-grid"></div>
+              </div>
+            </div>
 
             <label>Vrijeme:</label>
             <input type="text"
@@ -2527,7 +3230,7 @@ DETAIL_TEMPLATE = """
                    name="total"
                    value="{{ ('%.2f'|format(data.total)).replace('.', ',') if data.total is not none else '' }}" />
 
-            <label style="margin-top:0.6rem;">
+            <label class="label-checkbox" style="margin-top:0.6rem;">
               <input type="checkbox" name="warranty" {% if data.warranty %}checked{% endif %} />
               Garancija
             </label>
@@ -2555,7 +3258,7 @@ DETAIL_TEMPLATE = """
                   <td>
                     <select name="item-category">
                       {% for option in [
-                        "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Lijekovi, troškovi liječenja",
+                        "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Kućni ljubimci","Lijekovi, troškovi liječenja",
                         "Odjeća i obuća","Škola i dječje aktivnosti","Sport","Automobili","Osiguranja",
                         "Internet/mobitel/TV","Struja","Voda","Plin","Smeće","Komunalni doprinos",
                         "Vodni doprinos","Putovanja, izleti, ručkovi","Ostalo"
@@ -2610,13 +3313,13 @@ DETAIL_TEMPLATE = """
           let v = String(value).trim();
 
           // Ukloni razmake
-          v = v.replace(/\s+/g, '');
+          v = v.replace(/\\s+/g, '');
 
           // Zamijeni decimalni zarez točkom
           v = v.replace(',', '.');
 
           // Zadrži samo znamenke, minus i točku
-          v = v.replace(/[^0-9\.\-]/g, '');
+          v = v.replace(/[^0-9\\.\\-]/g, '');
 
           const num = parseFloat(v);
           return isNaN(num) ? NaN : num;
@@ -2660,7 +3363,7 @@ DETAIL_TEMPLATE = """
             <td>
               <select name="item-category">
                 {% for option in [
-                  "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Lijekovi, troškovi liječenja",
+                  "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Kućni ljubimci","Lijekovi, troškovi liječenja",
                   "Odjeća i obuća","Škola i dječje aktivnosti","Sport","Automobili","Osiguranja",
                   "Internet/mobitel/TV","Struja","Voda","Plin","Smeće","Komunalni doprinos",
                   "Vodni doprinos","Putovanja, izleti, ručkovi","Ostalo"
@@ -2687,172 +3390,176 @@ DETAIL_TEMPLATE = """
         });
 
         document.addEventListener('DOMContentLoaded', recalcItemsSum);
+
+        // --- Kalendar helper za polje "Datum" ---
+        (function () {
+          const wrapper = document.getElementById('date-field');
+          if (!wrapper) return;
+
+          const input = document.getElementById('date-input');
+          const toggleBtn = document.getElementById('date-picker-toggle');
+          const popup = document.getElementById('date-picker-popup');
+          const titleEl = document.getElementById('date-picker-title');
+          const gridEl = document.getElementById('date-picker-grid');
+          const prevBtn = document.getElementById('date-picker-prev');
+          const nextBtn = document.getElementById('date-picker-next');
+
+          const MONTHS = ['Siječanj', 'Veljača', 'Ožujak', 'Travanj', 'Svibanj', 'Lipanj',
+            'Srpanj', 'Kolovoz', 'Rujan', 'Listopad', 'Studeni', 'Prosinac'];
+
+          function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+
+          function toDateStr(y, m, d) { return y + '-' + pad2(m + 1) + '-' + pad2(d); }
+
+          function toDisplay(y, m, d) { return pad2(d) + '.' + pad2(m + 1) + '.' + y; }
+
+          function parseDisplay(value) {
+            const match = /^(\\d{1,2})\\.(\\d{1,2})\\.(\\d{4})$/.exec((value || '').trim());
+            if (!match) return null;
+            const d = parseInt(match[1], 10);
+            const m = parseInt(match[2], 10) - 1;
+            const y = parseInt(match[3], 10);
+            const dt = new Date(y, m, d);
+            if (dt.getFullYear() !== y || dt.getMonth() !== m || dt.getDate() !== d) return null;
+            return { y: y, m: m, d: d };
+          }
+
+          const now = new Date();
+          const todayStr = toDateStr(now.getFullYear(), now.getMonth(), now.getDate());
+
+          let selected = parseDisplay(input.value);
+          let viewYear = selected ? selected.y : now.getFullYear();
+          let viewMonth = selected ? selected.m : now.getMonth();
+
+          function render() {
+            titleEl.textContent = MONTHS[viewMonth].toUpperCase() + ' ' + viewYear;
+            gridEl.innerHTML = '';
+
+            const firstOfMonth = new Date(viewYear, viewMonth, 1);
+            const startOffset = (firstOfMonth.getDay() + 6) % 7; // ponedjeljak = 0
+            const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+            const totalCells = Math.ceil((startOffset + daysInMonth) / 7) * 7;
+            const selectedStr = selected ? toDateStr(selected.y, selected.m, selected.d) : null;
+
+            let week = null;
+            for (let i = 0; i < totalCells; i++) {
+              if (i % 7 === 0) {
+                week = document.createElement('div');
+                week.className = 'date-picker-week';
+                gridEl.appendChild(week);
+              }
+
+              const cellDate = new Date(viewYear, viewMonth, i - startOffset + 1);
+              const cellStr = toDateStr(cellDate.getFullYear(), cellDate.getMonth(), cellDate.getDate());
+              const isOutside = cellDate.getMonth() !== viewMonth;
+              const isFuture = cellStr > todayStr;
+
+              const btn = document.createElement('button');
+              btn.type = 'button';
+              btn.className = 'date-picker-day';
+              btn.textContent = String(cellDate.getDate());
+
+              if (isOutside) btn.classList.add('date-picker-day-outside');
+              if (cellStr === todayStr) btn.classList.add('date-picker-day-today');
+              if (cellStr === selectedStr) btn.classList.add('date-picker-day-selected');
+
+              if (isFuture) {
+                btn.disabled = true;
+              } else {
+                btn.addEventListener('click', function () {
+                  selected = { y: cellDate.getFullYear(), m: cellDate.getMonth(), d: cellDate.getDate() };
+                  input.value = toDisplay(selected.y, selected.m, selected.d);
+                  input.dispatchEvent(new Event('input', { bubbles: true }));
+                  input.dispatchEvent(new Event('change', { bubbles: true }));
+                  closePopup();
+                });
+              }
+
+              week.appendChild(btn);
+            }
+          }
+
+          function openPopup() {
+            selected = parseDisplay(input.value);
+            viewYear = selected ? selected.y : now.getFullYear();
+            viewMonth = selected ? selected.m : now.getMonth();
+            render();
+            popup.hidden = false;
+          }
+
+          function closePopup() {
+            popup.hidden = true;
+          }
+
+          toggleBtn.addEventListener('click', function (event) {
+            event.stopPropagation();
+            if (popup.hidden) {
+              openPopup();
+            } else {
+              closePopup();
+            }
+          });
+
+          prevBtn.addEventListener('click', function () {
+            viewMonth -= 1;
+            if (viewMonth < 0) { viewMonth = 11; viewYear -= 1; }
+            render();
+          });
+
+          nextBtn.addEventListener('click', function () {
+            viewMonth += 1;
+            if (viewMonth > 11) { viewMonth = 0; viewYear += 1; }
+            render();
+          });
+
+          document.addEventListener('click', function (event) {
+            if (!popup.hidden && !wrapper.contains(event.target)) {
+              closePopup();
+            }
+          });
+
+          document.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape' && !popup.hidden) {
+              closePopup();
+              toggleBtn.focus();
+            }
+          });
+        })();
       </script>
     </div>
   </body>
 </html>
 """
+)
 
-CATEGORY_ITEMS_TEMPLATE = """
+CATEGORY_ITEMS_TEMPLATE = (
+    """
 <!DOCTYPE html>
 <html lang="hr">
   <head>
     <meta charset="utf-8" />
-    <title>Pregled kategorije {{ category }} - {{ month_name }} {{ year }}</title>
-    <style>
-      :root {
-        --color-bg: #F4F7FB;
-        --color-card: #FFFFFF;
-        --color-border: #D6DFEA;
-        --color-text: #111827;
-        --color-text-muted: #6B7280;
-
-        --color-primary: #12324A;
-        --color-primary-light: #1F4F7F;
-        --color-primary-soft: #E3EDF7;
-
-        --color-success: #137333;
-        --color-danger: #B00020;
-      }
-
-      * {
-        box-sizing: border-box;
-      }
-
-      body {
-        margin: 0;
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: var(--color-bg);
-        color: var(--color-text);
-      }
-
-      .page {
-        max-width: 2000px;
-        margin: 0 auto;
-        padding: 1.5rem 1.5rem 3rem;
-      }
-
-      .topbar {
-        background: var(--color-primary);
-        color: #fff;
-        padding: 0.75rem 1.5rem;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.15);
-      }
-
-      .topbar-title {
-        font-weight: 600;
-        letter-spacing: 0.03em;
-      }
-
-      .topbar-actions {
-        display: flex;
-        gap: 0.5rem;
-        align-items: center;
-      }
-
-      a.button,
-      button.button {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        padding: 0.5rem 1.1rem;
-        background: var(--color-primary);
-        color: #fff;
-        border-radius: 9999px;
-        border: none;
-        font-size: 0.9rem;
-        cursor: pointer;
-        text-decoration: none;
-        transition: background 0.15s ease, transform 0.05s ease;
-      }
-
-      a.button:hover,
-      button.button:hover {
-        background: var(--color-primary-light);
-        transform: translateY(-1px);
-      }
-
-      h1, h2, h3 {
-        margin: 1.5rem 0 0.75rem;
-        color: var(--color-primary);
-      }
-
-      .card {
-        background: var(--color-card);
-        border-radius: 12px;
-        border: 1px solid var(--color-border);
-        padding: 1rem 1.25rem;
-        margin-top: 1rem;
-        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.04);
-      }
-
-      table {
-        width: 100%;
-        border-collapse: collapse;
-        margin-top: 0.5rem;
-        background: var(--color-card);
-      }
-
-      th, td {
-        padding: 0.45rem 0.5rem;
-        text-align: left;
-        border-bottom: 1px solid #EAECF0;
-        font-size: 0.85rem;
-      }
-
-      th {
-        background: var(--color-primary-soft);
-        font-weight: 600;
-        color: var(--color-primary);
-      }
-
-      tbody tr:nth-child(even) td {
-        background: #FAFCFF;
-      }
-
-      tbody tr:hover td {
-        background: #E9F2FD;
-      }
-
-      .amount-cell {
-        text-align: right;
-        font-variant-numeric: tabular-nums;
-      }
-
-      .empty {
-        margin-top: 2rem;
-        font-style: italic;
-        color: var(--color-text-muted);
-      }
-
-      @media (max-width: 768px) {
-        .page {
-          padding: 1rem;
-        }
-        table {
-          display: block;
-          overflow-x: auto;
-          white-space: nowrap;
-        }
-      }
+    <title>Pregled kategorije {{ category }} - {{ month_name }} {{ year }}</title>"""
+    + FONT_LINKS
+    + """
+    <style>"""
+    + BASE_STYLE
+    + """
     </style>
   </head>
   <body>
     <div class="topbar">
       <div>
         <div class="topbar-title">Billing me softly</div>
+        <div class="topbar-subtitle">Kategorija &middot; mjesečni pregled</div>
       </div>
       <div class="topbar-actions">
-        <a class="button" href="{{ back_url }}">Natrag</a>
+        <a class="button button-onbar" href="{{ back_url }}">Natrag</a>
       </div>
     </div>
 
     <div class="page">
       <h2>Pregled kategorije "{{ category }}" za {{ month_name }} {{ year }}</h2>
-      <p style="color:var(--color-text-muted); font-size:0.9rem;">
+      <p class="small-text">
         Ukupno: <strong>{{ ("%.2f"|format(total_amount)).replace(".", ",") }} €</strong>
       </p>
 
@@ -2887,7 +3594,7 @@ CATEGORY_ITEMS_TEMPLATE = """
                   {{ ('%.2f'|format(item.total_price)).replace('.', ',') if item.total_price is not none else '' }}
                 </td>
                 <td>
-                  <a class="button"
+                  <a class="button button-primary"
                      href="{{ url_for('receipt_detail', receipt_id=item.receipt_id) }}">
                     Otvori račun
                   </a>
@@ -2899,14 +3606,159 @@ CATEGORY_ITEMS_TEMPLATE = """
       {% else %}
         <p class="empty">
           Nema stavki za ovu kombinaciju godine, mjeseca i kategorije.
-          Ili si stvarno štedljiv, ili filteri lažu. 🙂
+          Ili si stvarno štedljiv, ili filteri lažu.
         </p>
       {% endif %}
     </div>
   </body>
 </html>
 """
+)
 
+
+BATCH_STATUS_TEMPLATE = (
+    """
+<!DOCTYPE html>
+<html lang="hr">
+  <head>
+    <meta charset="utf-8" />
+    <title>Obrada u tijeku &mdash; Billing me softly</title>"""
+    + FONT_LINKS
+    + """
+    <style>"""
+    + BASE_STYLE
+    + """
+      .status-queued { color: var(--ink-soft); }
+      .status-processing { color: var(--stamp); }
+      .status-done { color: var(--success); }
+      .status-error { color: var(--stamp-dark); }
+
+      .status-processing::before {
+        content: "";
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        margin-right: 0.35rem;
+        border-radius: 50%;
+        background: currentColor;
+        animation: batch-pulse 1s ease-in-out infinite;
+      }
+
+      @keyframes batch-pulse {
+        0%, 100% { opacity: 0.25; }
+        50% { opacity: 1; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .status-processing::before { animation: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="topbar">
+      <div>
+        <div class="topbar-title">Billing me softly</div>
+        <div class="topbar-subtitle">Obrada u tijeku</div>
+      </div>
+      <div class="topbar-actions">
+        <a class="button button-onbar" href="{{ url_for('index') }}">Natrag</a>
+      </div>
+    </div>
+
+    <div class="page">
+      <h1>Obrada računa</h1>
+
+      <div id="done-banner" class="alert alert-success" style="display:{{ 'block' if done else 'none' }};">
+        Obrada završena &mdash; preusmjeravam na pregled...
+      </div>
+      <div id="expired-banner" class="alert alert-error" style="display:none;">
+        Obrada je istekla ili nije pronađena. <a class="cell-link" href="{{ url_for('index') }}">Natrag na početnu.</a>
+      </div>
+
+      <div class="card">
+        <table>
+          <thead>
+            <tr>
+              <th>Datoteka</th>
+              <th>Status</th>
+              <th>Napomena</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for file in files %}
+            <tr data-idx="{{ file.idx }}">
+              <td>{{ file.name }}</td>
+              <td>
+                <span class="warranty-pill status-{{ file.status }}" id="status-{{ file.idx }}">
+                  {% if file.status == 'queued' %}Na čekanju
+                  {%- elif file.status == 'processing' %}Obrađuje se
+                  {%- elif file.status == 'done' %}Gotovo
+                  {%- elif file.status == 'error' %}Greška
+                  {%- else %}{{ file.status }}{% endif %}
+                </span>
+              </td>
+              <td class="small-text" id="error-{{ file.idx }}">{{ file.error or '' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <script>
+        const batchId = {{ batch_id | tojson }};
+        const labels = {queued: "Na čekanju", processing: "Obrađuje se", done: "Gotovo", error: "Greška"};
+
+        function applyStatus(file) {
+          const statusEl = document.getElementById("status-" + file.idx);
+          const errorEl = document.getElementById("error-" + file.idx);
+          if (statusEl) {
+            statusEl.className = "warranty-pill status-" + file.status;
+            statusEl.textContent = labels[file.status] || file.status;
+          }
+          if (errorEl) {
+            errorEl.textContent = file.error || "";
+          }
+        }
+
+        function showExpiredNotice() {
+          const el = document.getElementById("expired-banner");
+          if (el) el.style.display = "block";
+        }
+
+        let redirecting = false;
+
+        async function poll() {
+          let res;
+          try {
+            res = await fetch("/batch/" + batchId + "/status.json");
+          } catch (err) {
+            return;
+          }
+          if (!res.ok) {
+            clearInterval(timer);
+            showExpiredNotice();
+            return;
+          }
+          const data = await res.json();
+          data.files.forEach(applyStatus);
+          if (data.done && !redirecting) {
+            redirecting = true;
+            clearInterval(timer);
+            document.getElementById("done-banner").style.display = "block";
+            setTimeout(function () {
+              window.location.href = "/batch/" + batchId + "/review";
+            }, 500);
+          }
+        }
+
+        const timer = setInterval(poll, 1200);
+        poll();
+      </script>
+    </div>
+  </body>
+</html>
+"""
+)
 
 
 def _normalize_date_for_db(value: Optional[str]) -> Optional[str]:
@@ -2975,10 +3827,7 @@ def _validate_receipt_payload(payload: dict, require_date: bool = False, require
     return None
 
 
-def build_receipt_data(image_path: str, language: str) -> ReceiptData:
-    log_progress(f"Pokrećem Gemini Vision pipeline za {image_path}...")
-    llm_payload = call_gemini_vision_parser(image_path)
-
+def _build_receipt_data_from_payload(llm_payload: dict, image_path: str, language: str) -> ReceiptData:
     items: List[ReceiptItem] = []
     for raw in llm_payload.get("items", []):
         raw = raw or {}
@@ -3013,16 +3862,11 @@ def build_receipt_data(image_path: str, language: str) -> ReceiptData:
     )
 
 
+def build_receipt_data(image_path: str, language: str) -> ReceiptData:
+    log_progress(f"Pokrećem Gemini Vision pipeline za {image_path}...")
+    llm_payload = call_gemini_vision_parser(image_path)
+    return _build_receipt_data_from_payload(llm_payload, image_path, language)
 
-def dump_receipt_json(data: ReceiptData, output_path: str) -> None:
-    with open(output_path, "w", encoding="utf-8") as handle:
-        json.dump(serialise_receipt(data), handle, ensure_ascii=False, indent=2)
-
-
-def write_receipt_json_payload(payload: dict, output_path: str) -> None:
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
 def receipt_from_payload(payload: dict) -> ReceiptData:
@@ -3108,13 +3952,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help=f"Language label saved in output JSON (default: '{DEFAULT_LANG}')",
     )
     parser.add_argument(
-        "--output",
-        help="Destination JSON path. Defaults to <image>_parsed.json in CWD.",
-    )
-    parser.add_argument(
         "--db-path",
-        default="receipts.db",
-        help="SQLite database for reviewed receipts (default: receipts.db)",
+        default=DEFAULT_DB_PATH,
+        help=f"SQLite database for reviewed receipts (default: {DEFAULT_DB_PATH})",
     )
     parser.add_argument(
         "--serve",
@@ -3135,15 +3975,97 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _migrate_legacy_repo_data(data_dir: str) -> None:
+    """
+    Jednokratna migracija: ako receipts.db/uploads/ još postoje u korijenu
+    repozitorija (stari CWD-relativni default) a u novom home-based data_dir
+    još nema baze, premjesti ih. Nakon prvog pokretanja nema efekta.
+    """
+    legacy_root = os.path.dirname(os.path.abspath(__file__))
+    legacy_db = os.path.join(legacy_root, "receipts.db")
+    legacy_uploads = os.path.join(legacy_root, "uploads")
+    target_db = os.path.join(data_dir, "receipts.db")
+    target_uploads = os.path.join(data_dir, "uploads")
+
+    if not os.path.exists(target_db) and os.path.exists(legacy_db):
+        os.makedirs(data_dir, exist_ok=True)
+        shutil.move(legacy_db, target_db)
+        log_progress(f"Migrirana baza iz '{legacy_db}' u '{target_db}'.")
+
+    # "Već migrirano" provjeravamo po sadržaju, ne po pukom postojanju direktorija —
+    # bootstrap.py unaprijed kreira prazan uploads/ pa gola isdir() provjera pogrešno
+    # preskoči migraciju stvarnih slika.
+    target_uploads_has_content = os.path.isdir(target_uploads) and any(os.scandir(target_uploads))
+    if os.path.isdir(legacy_uploads) and not target_uploads_has_content:
+        os.makedirs(data_dir, exist_ok=True)
+        if os.path.isdir(target_uploads):
+            os.rmdir(target_uploads)
+        shutil.move(legacy_uploads, target_uploads)
+        log_progress(f"Migriran uploads/ direktorij iz '{legacy_uploads}' u '{target_uploads}'.")
+
+        # image_path u bazi je apsolutna putanja snimljena pod starim (repo-root) prefiksom —
+        # nakon fizičkog premještanja uploads/ mora se prepisati na novi prefiks, inače
+        # postojeći računi izgube sliku.
+        if os.path.exists(target_db):
+            conn = sqlite3.connect(target_db)
+            try:
+                conn.execute(
+                    "UPDATE receipts SET image_path = ? || substr(image_path, ?) "
+                    "WHERE image_path LIKE ? || '%'",
+                    (target_uploads, len(legacy_uploads) + 1, legacy_uploads),
+                )
+                conn.commit()
+                log_progress(f"Ažurirane putanje slika u bazi ({conn.total_changes} redaka).")
+            finally:
+                conn.close()
+
+
+def _repair_broken_image_paths(db_path: str, uploads_dir: str) -> None:
+    """
+    Popravlja image_path retke koji ne postoje na disku na trenutnoj putanji —
+    tipično nakon kopiranja receipts.db + uploads/ s drugog OS-a/lokacije (npr.
+    Linux -> Windows), gdje je stara apsolutna putanja (drugi prefiks, drugi
+    separator) i dalje zapisana u bazi iako su slike fizički već u uploads_dir.
+    Traži datoteku istog imena unutar uploads_dir i, ako postoji, prepisuje
+    putanju. Sentinel vrijednosti (manual://..., excel://...) nikad nemaju
+    odgovarajuću datoteku pa se tiho preskaču.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute("SELECT id, image_path FROM receipts").fetchall()
+        fixed = 0
+        for receipt_id, image_path in rows:
+            if not image_path or os.path.exists(image_path):
+                continue
+            candidate = os.path.join(uploads_dir, os.path.basename(image_path))
+            if candidate != image_path and os.path.isfile(candidate):
+                conn.execute(
+                    "UPDATE receipts SET image_path = ? WHERE id = ?",
+                    (candidate, receipt_id),
+                )
+                fixed += 1
+        if fixed:
+            conn.commit()
+            log_progress(f"Popravljene putanje slika za {fixed} računa (pronađeno po imenu datoteke u '{uploads_dir}').")
+    finally:
+        conn.close()
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
+    if args.db_path == DEFAULT_DB_PATH:
+        _migrate_legacy_repo_data(str(DATA_DIR))
+
     init_db(args.db_path)
+
+    if args.db_path == DEFAULT_DB_PATH:
+        _repair_broken_image_paths(args.db_path, UPLOAD_DIR)
 
     if args.serve:
         log_progress(f"Pokrećem web poslužitelj na http://{args.host}:{args.port}")
         app = create_app(args.db_path, args.lang, GEMINI_MODEL)
-        app.run(host=args.host, port=args.port, debug=False)
+        app.run(host=args.host, port=args.port, debug=False, threaded=True)
         return 0
 
     image_path = args.image
@@ -3162,13 +4084,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Gemini obrada nije uspjela: {exc}", file=sys.stderr)
         return 2
 
-    output_path = args.output
-    if not output_path:
-        base_name = os.path.splitext(os.path.basename(image_path))[0]
-        output_path = f"{base_name}_parsed.json"
-
-    dump_receipt_json(receipt, output_path)
-    save_receipt_to_db(receipt, output_path, args.db_path)
+    save_receipt_to_db(receipt, args.db_path)
 
     print(f"Obrada dovršena za '{receipt.image}'.")
     print(f"Prepoznato stavki: {len(receipt.items)}")
@@ -3191,7 +4107,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
     else:
         print("Nije pronađen ukupni iznos.")
-    print(f"JSON spremljen u: {output_path}")
+    print(f"Spremljeno u bazu: {args.db_path}")
 
     return 0
 
