@@ -65,7 +65,7 @@ The entire application lives in a single file: `receipt_ocr.py` (~3400 lines). C
 
 ## Expense Categories (predefined in Gemini prompt)
 
-Hrana, Cigarete/alkohol/kave, Kućne potrepštine, Kućni ljubimci, Lijekovi, Odjeća i obuća, Škola i dječje aktivnosti, Sport, Automobili, Osiguranja, Internet/mobitel/TV, Struja, Voda, Plin, Smeće, Komunalni doprinos, Vodni doprinos, Putovanja/izleti/ručkovi, Ostalo.
+Hrana, Cigarete, alkohol, kave,..., Kućne potrepštine, Kućni ljubimci, Lijekovi, troškovi liječenja, Odjeća i obuća, Škola i dječje aktivnosti, Sport, Automobili, Osiguranja, Internet/mobitel/TV, Struja, Voda, Plin, Smeće, Komunalni doprinos, Vodni doprinos, Putovanja, izleti, ručkovi, Ostalo. (Exact strings as used in the Gemini prompt and the dashboard — note the commas; the DB stores these literal names, so don't "normalize" them.)
 
 ## Key Configuration (`config.py`)
 
@@ -85,4 +85,5 @@ Hrana, Cigarete/alkohol/kave, Kućne potrepštine, Kućni ljubimci, Lijekovi, Od
 - Templates are rendered inline via Jinja2 (no separate template files). JS regexes embedded in these non-raw Python strings must double their backslashes (`\\s`, `\\d`, `\\.`) — a single backslash triggers a `SyntaxWarning` on newer Python (3.12+) and will become an error in future versions.
 - Development happens on Linux/WSL, but the app is also run on the Windows host (`C:\Users\<user>\...`); when testing OS-specific behavior, run the Windows side via `powershell.exe` from WSL.
 - `old_scripts/` contains legacy backups — do not modify.
+- `README.md` is the public GitHub landing page; `docs/screenshots/` are generated from a fictional demo database (never real receipts) — regenerate the same way if the UI changes.
 - `uploads/` (under `DATA_DIR`, i.e. `~/BillingMeSoftly/uploads/`) contains only receipt images. No `_parsed.json` files are written; parsed data lives exclusively in `receipts.db`.
