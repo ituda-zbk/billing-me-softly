@@ -14,7 +14,7 @@
 
 ## Features
 
-- **OCR with Gemini Vision.** Extracts line items, quantities, prices, date, time and total from receipt photos (PNG, JPG, WebP, HEIC, TIFF) and assigns each item one of 19 expense categories.
+- **OCR with Gemini Vision.** Extracts line items, quantities, prices, date, time and total from receipt photos (PNG, JPG, WebP, HEIC, TIFF) and assigns each item one of 19 expense categories. Receipts that print the same date in several formats (e.g. `14.09.26` in the fiscal part and `26/09/14` on the card-terminal slip) are resolved to a single correct date instead of confusing year and day.
 - **Batch upload.** Upload up to 100 photos at once or import a whole folder (for example a synced OneDrive folder). Processing runs in the background with a live per-image progress page.
 - **Free-tier friendly.** Up to 5 images go into a single Gemini request, because the free daily quota is counted per request, not per image. Requests are rate-limited and quota exhaustion is detected and reported.
 - **Review before saving.** Every parsed receipt opens in an edit form: fix items, categories and prices, rotate the image, flag warranty items. The form shows the automatic sum of items next to the total so mismatches are easy to spot (the CLI prints an explicit warning).

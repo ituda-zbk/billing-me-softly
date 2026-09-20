@@ -59,6 +59,19 @@ def log_progress(message: str) -> None:
     print(line, flush=True)
 
 
+# Pravila za datum dijele jednoslikovni i batch prompt. Ne smije sadržavati vitičaste
+# zagrade jer se batch predložak provlači kroz str.format().
+# Model se ovdje koristi samo kao OCR datuma ("date_candidates"); odabir pravog datuma
+# među njima radi _resolve_receipt_date() jer model bez "thinking" budžeta zna prepisati
+# oba datuma ispravno, a onda ih krivo protumačiti (godina <-> dan).
+_GEMINI_DATE_RULES = """
+PRAVILA ZA DATUM:
+- Račun često ima VIŠE datuma u RAZLIČITIM formatima (npr. DD.MM.YY u fiskalnom dijelu računa i YY/MM/DD na slipu kartičnog terminala).
+- U "date_candidates" doslovno prepiši SVE datume s računa, znak po znak, točno kako su ispisani (isti separatori i isti broj znamenki). Samo datume, bez vremena; svaki različiti zapis samo jednom. Ako datum nije čitljiv ili ga nema na slici, vrati "date_candidates": [] i "date": null; NIKAD ne izmišljaj datum.
+- U "date" upiši najbolju procjenu kao "YYYY-MM-DD". Točke znače DD.MM.YY(YY), dan je prvi; "YY/MM/DD" na slipovima terminala ima godinu prvu. Ako nisi siguran, vrati null.
+""".strip()
+
+
 GEMINI_VISION_PROMPT = """
 Pročitaj račun sa slike i vrati isključivo valjani JSON bez markdowna.
 JSON shema:
@@ -73,13 +86,15 @@ JSON shema:
     }
   ],
   "total": number | null,
-  "date": "YYYY-MM-DD ili DD.MM.YYYY" | null,
+  "date_candidates": [string],
+  "date": "YYYY-MM-DD" | null,
   "time": "HH:MM[:SS]" | null
 }
 Pravila:
 - decimalne zareze pretvori u točku
 - nepoznate vrijednosti postavi na null
-""".strip()
+
+""".lstrip() + _GEMINI_DATE_RULES
 
 
 GEMINI_VISION_BATCH_PROMPT_TEMPLATE = """
@@ -102,7 +117,8 @@ Vrati isključivo valjani JSON bez markdowna, ove strukture:
         }}
       ],
       "total": number | null,
-      "date": "YYYY-MM-DD ili DD.MM.YYYY" | null,
+      "date_candidates": [string],
+      "date": "YYYY-MM-DD" | null,
       "time": "HH:MM[:SS]" | null
     }}
   ]
@@ -110,6 +126,9 @@ Vrati isključivo valjani JSON bez markdowna, ove strukture:
 Pravila:
 - decimalne zareze pretvori u točku
 - nepoznate vrijednosti postavi na null
+- datum određuj za SVAKU sliku zasebno, samo iz te slike
+
+{date_rules}
 """.strip()
 
 
@@ -1167,7 +1186,8 @@ def call_gemini_vision_batch_parser(image_paths: List[str]) -> Dict[int, Optiona
     None, i pozivatelj je NIKAD ne smije spremiti kao uspješan rezultat.
     """
     n = len(image_paths)
-    parts = [{"text": GEMINI_VISION_BATCH_PROMPT_TEMPLATE.format(n=n)}]
+    batch_prompt = GEMINI_VISION_BATCH_PROMPT_TEMPLATE.format(n=n, date_rules=_GEMINI_DATE_RULES)
+    parts = [{"text": batch_prompt}]
     parts.extend(_image_to_inline_part(p) for p in image_paths)
 
     payload = {
@@ -3893,6 +3913,66 @@ def _normalize_date_for_db(value: Optional[str]) -> Optional[str]:
             continue
     return None
 
+_DATE_CANDIDATE_RE = re.compile(r"(?<!\d)(\d{1,4})([./-])(\d{1,2})\2(\d{1,4})(?!\d)")
+
+
+def _date_interpretations(text: str) -> set:
+    """Sve kalendarski valjane, ne-buduće interpretacije jednog prepisanog datuma.
+
+    Točke su uvijek DD.MM.YY(YY). S kosom crtom/crticom i dvoznamenkastim rubovima
+    ("26/09/14") oblik je dvosmislen: DD/MM/YY ili YY/MM/DD, pa vraća oba.
+    """
+    m = _DATE_CANDIDATE_RE.search(str(text))
+    if not m:
+        return set()
+    a, sep, b, c = m.group(1), m.group(2), m.group(3), m.group(4)
+    layouts = []  # (godina, mjesec, dan) kao stringovi
+    if len(a) == 4:
+        layouts.append((a, b, c))            # YYYY-MM-DD
+    elif len(c) == 4:
+        layouts.append((c, b, a))            # DD.MM.YYYY
+    else:
+        layouts.append((c, b, a))            # DD.MM.YY
+        if sep != ".":
+            layouts.append((a, b, c))        # YY/MM/DD
+    now = datetime.now()
+    found = set()
+    for y, mo, d in layouts:
+        year = int(y) + (2000 if len(y) <= 2 else 0)
+        try:
+            dt = datetime(year, int(mo), int(d))
+        except ValueError:
+            continue
+        if dt <= now:
+            found.add(dt.strftime("%Y-%m-%d"))
+    return found
+
+
+def _resolve_receipt_date(candidates, model_date: Optional[str]) -> Optional[str]:
+    """Odaberi datum računa iz doslovno prepisanih datuma ("date_candidates").
+
+    Svaki kandidat glasa za sve svoje valjane interpretacije; pobjeđuje datum s
+    najviše glasova (računi često nose isti dan dvaput u različitim formatima,
+    npr. "14.09.26" + "26/09/14" -> 2026-09-14). Kod izjednačenja prednost ima
+    datum koji je model sam vratio, a zatim noviji. Bez upotrebljivih kandidata
+    vraća normaliziran model_date.
+    """
+    fallback = _normalize_date_for_db(model_date)
+    if not isinstance(candidates, (list, tuple)):
+        return fallback
+    votes: Dict[str, int] = {}
+    for cand in candidates:
+        for iso in _date_interpretations(cand):
+            votes[iso] = votes.get(iso, 0) + 1
+    if not votes:
+        return fallback
+    best = max(votes.values())
+    tied = [d for d, v in votes.items() if v == best]
+    if fallback in tied:
+        return fallback
+    return max(tied)
+
+
 def _format_date_for_display(value: Optional[str]) -> str:
     """
     Formatira datum za prikaz kao 'dd.mm.yyyy', bez obzira je li spremljen kao
@@ -3964,7 +4044,7 @@ def _build_receipt_data_from_payload(llm_payload: dict, image_path: str, languag
     )
     total_value = _to_optional_float(llm_payload.get("total"))
     raw_date_value = _clean_string(llm_payload.get("date"))
-    date_value = _normalize_date_for_db(raw_date_value)
+    date_value = _resolve_receipt_date(llm_payload.get("date_candidates"), raw_date_value)
     time_value = _clean_string(llm_payload.get("time"))
 
     return ReceiptData(
