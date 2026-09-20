@@ -22,7 +22,7 @@ from uuid import uuid4
 from PIL import Image, ImageOps
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from flask import Flask, request, redirect, url_for, render_template_string, send_file, abort, jsonify
+from flask import Flask, Response, request, redirect, url_for, render_template_string, send_file, abort, jsonify
 from werkzeug.utils import secure_filename
 from config import (
     MAX_NEW_TOKENS,
@@ -1537,6 +1537,22 @@ def render_review_page(
 def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
     app = Flask(__name__)
 
+    def _icon_response() -> Response:
+        return Response(
+            _APP_ICON_PNG,
+            mimetype="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.route("/favicon.png")
+    def app_icon() -> Response:
+        return _icon_response()
+
+    # Preglednici sami traže /favicon.ico; isti PNG (moderni preglednici ga prihvaćaju).
+    @app.route("/favicon.ico")
+    def app_icon_ico() -> Response:
+        return _icon_response()
+
     @app.route("/", methods=["GET"])
     def index() -> str:
         # Defaultno: sortiraj po datumu (noviji prvo) i prikaži zadnjih 100 računa
@@ -2197,6 +2213,76 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
     return app
 
 
+# Ikona aplikacije (TornReceipt): 128px PNG s prozirnim kutovima, ugrađena kao base64 da
+# aplikacija ostane samostalna (radi i kad se kopira samo receipt_ocr.py + config.py).
+# Služi se na /favicon.png i /favicon.ico; koristi se kao favicon i u zaglavlju stranica.
+_APP_ICON_PNG_B64 = (
+    "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"
+)
+_APP_ICON_PNG = base64.b64decode(_APP_ICON_PNG_B64)
+
+ICON_LINKS = """
+    <link rel="icon" type="image/png" href="{{ url_for('app_icon') }}" />"""
+
 FONT_LINKS = """
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -2268,6 +2354,20 @@ BASE_STYLE = """
     background-size: 18px 18px, 18px 18px;
     background-position: 0 0, 9px 0;
     background-repeat: repeat-x;
+  }
+
+  .topbar-brand {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+  }
+
+  .topbar-logo {
+    display: block;
+    flex: none;
+    width: 46px;
+    height: 46px;
+    border-radius: 11px;
   }
 
   .topbar-title {
@@ -2735,6 +2835,7 @@ INDEX_TEMPLATE = (
     <meta charset="utf-8" />
     <title>Billing me softly</title>"""
     + FONT_LINKS
+    + ICON_LINKS
     + """
 <style>"""
     + BASE_STYLE
@@ -2743,10 +2844,13 @@ INDEX_TEMPLATE = (
   </head>
   <body>
     <div class="topbar">
-      <div>
+      <div class="topbar-brand">
+        <img class="topbar-logo" src="{{ url_for('app_icon') }}" alt="" width="46" height="46" />
+        <div>
         <div class="topbar-title">Billing me softly</div>
         <div class="topbar-subtitle">Evidencija troškova</div>
         <div class="topbar-barcode">{% for _ in range(28) %}<span></span>{% endfor %}</div>
+        </div>
       </div>
       <div class="topbar-actions">
         <a class="button button-onbar" href="/">Osvježi</a>
@@ -2965,6 +3069,7 @@ DETAIL_TEMPLATE = (
     <meta charset="utf-8" />
     <title>Račun {{ receipt.id if receipt and receipt.id else 'Novi račun' }}</title>"""
     + FONT_LINKS
+    + ICON_LINKS
     + """
     <style>"""
     + BASE_STYLE
@@ -3039,9 +3144,12 @@ DETAIL_TEMPLATE = (
   </head>
   <body>
     <div class="topbar">
-      <div>
+      <div class="topbar-brand">
+        <img class="topbar-logo" src="{{ url_for('app_icon') }}" alt="" width="46" height="46" />
+        <div>
         <div class="topbar-title">Billing me softly</div>
         <div class="topbar-subtitle">Uređivanje računa</div>
+        </div>
       </div>
       <div class="topbar-actions">
         <a class="button button-onbar" href="{{ url_for('index') }}">Natrag na popis</a>
@@ -3540,6 +3648,7 @@ CATEGORY_ITEMS_TEMPLATE = (
     <meta charset="utf-8" />
     <title>Pregled kategorije {{ category }} - {{ month_name }} {{ year }}</title>"""
     + FONT_LINKS
+    + ICON_LINKS
     + """
     <style>"""
     + BASE_STYLE
@@ -3548,9 +3657,12 @@ CATEGORY_ITEMS_TEMPLATE = (
   </head>
   <body>
     <div class="topbar">
-      <div>
+      <div class="topbar-brand">
+        <img class="topbar-logo" src="{{ url_for('app_icon') }}" alt="" width="46" height="46" />
+        <div>
         <div class="topbar-title">Billing me softly</div>
         <div class="topbar-subtitle">Kategorija &middot; mjesečni pregled</div>
+        </div>
       </div>
       <div class="topbar-actions">
         <a class="button button-onbar" href="{{ back_url }}">Natrag</a>
@@ -3624,6 +3736,7 @@ BATCH_STATUS_TEMPLATE = (
     <meta charset="utf-8" />
     <title>Obrada u tijeku &mdash; Billing me softly</title>"""
     + FONT_LINKS
+    + ICON_LINKS
     + """
     <style>"""
     + BASE_STYLE
@@ -3656,9 +3769,12 @@ BATCH_STATUS_TEMPLATE = (
   </head>
   <body>
     <div class="topbar">
-      <div>
+      <div class="topbar-brand">
+        <img class="topbar-logo" src="{{ url_for('app_icon') }}" alt="" width="46" height="46" />
+        <div>
         <div class="topbar-title">Billing me softly</div>
         <div class="topbar-subtitle">Obrada u tijeku</div>
+        </div>
       </div>
       <div class="topbar-actions">
         <a class="button button-onbar" href="{{ url_for('index') }}">Natrag</a>
