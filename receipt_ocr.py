@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
@@ -151,6 +152,7 @@ class ReceiptData:
     date: Optional[str]
     time: Optional[str]
     warranty: bool = False
+    image_hash: Optional[str] = None
 
 
 _THREAD_LOCAL = threading.local()
@@ -194,6 +196,16 @@ def init_db(db_path: str) -> None:
             conn.execute("ALTER TABLE receipts ADD COLUMN warranty INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+
+        # image_hash: sha256 izvornih bajtova slike (prije EXIF/resize/format obrade),
+        # koristi se za otkrivanje da je ista datoteka već uvezena (vidi find_receipt_by_hash).
+        try:
+            conn.execute("ALTER TABLE receipts ADD COLUMN image_hash TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_receipts_image_hash ON receipts(image_hash)"
+        )
 
         conn.execute(
             """
@@ -334,8 +346,8 @@ def save_receipt_to_db(receipt: ReceiptData, db_path: str) -> None:
     try:
         cur = conn.execute(
             """
-            INSERT INTO receipts (image_path, language, total, items_sum, date, time, warranty, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO receipts (image_path, language, total, items_sum, date, time, warranty, image_hash, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(image_path) DO UPDATE SET
                 language=excluded.language,
                 total=excluded.total,
@@ -343,6 +355,7 @@ def save_receipt_to_db(receipt: ReceiptData, db_path: str) -> None:
                 date=excluded.date,
                 time=excluded.time,
                 warranty=excluded.warranty,
+                image_hash=excluded.image_hash,
                 updated_at=excluded.updated_at
             RETURNING id
             """,
@@ -354,6 +367,7 @@ def save_receipt_to_db(receipt: ReceiptData, db_path: str) -> None:
                 receipt.date,
                 receipt.time,
                 1 if receipt.warranty else 0,
+                receipt.image_hash,
                 now,
                 now,
             ),
@@ -591,6 +605,32 @@ def fetch_receipt_record(receipt_id: int, db_path: str) -> sqlite3.Row:
         conn.close()
 
 
+def _sha256_of_file(path: str) -> str:
+    """Sha256 sadržaja datoteke. Mora se zvati NA IZVORNIM bajtovima, prije
+    normalize_image_orientation/ensure_gemini_compatible_image/resize_image —
+    te funkcije mijenjaju sadržaj datoteke, pa bi hash izračunat nakon njih
+    promašio duplikat kod ponovnog uploada iste izvorne slike."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def find_receipt_by_hash(image_hash: Optional[str], db_path: str) -> Optional[sqlite3.Row]:
+    """Vrati postojeći račun s istim image_hash (bajt-identična slika već uvezena), ili None."""
+    if not image_hash:
+        return None
+    conn = get_db_connection(db_path)
+    try:
+        return conn.execute(
+            "SELECT id, date, total FROM receipts WHERE image_hash = ? LIMIT 1",
+            (image_hash,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
 def update_receipt_record(receipt_id: int, data: dict, db_path: str) -> None:
     now = datetime.now().isoformat(timespec="seconds")
     conn = get_db_connection(db_path)
@@ -612,6 +652,16 @@ def update_receipt_record(receipt_id: int, data: dict, db_path: str) -> None:
             ),
         )
         _replace_receipt_items(conn, receipt_id, data.get("items", []))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_receipt_record(receipt_id: int, db_path: str) -> None:
+    """Briše račun iz baze; receipt_items se briše automatski (ON DELETE CASCADE, FK uključen)."""
+    conn = get_db_connection(db_path)
+    try:
+        conn.execute("DELETE FROM receipts WHERE id = ?", (receipt_id,))
         conn.commit()
     finally:
         conn.close()
@@ -1256,8 +1306,10 @@ def _package_processed_entry(used_path: str, receipt: ReceiptData, source_path: 
 
 
 def process_single_image(image_path: str, language: str, source_path: Optional[str] = None) -> dict:
+    # Hash IZVORNIH bajtova, prije nego što prepare_image_for_gemini nešto promijeni na disku.
+    image_hash = _sha256_of_file(image_path)
     used_path = prepare_image_for_gemini(image_path)
-    receipt = build_receipt_data(used_path, language)
+    receipt = build_receipt_data(used_path, language, image_hash=image_hash)
     return _package_processed_entry(used_path, receipt, source_path)
 
 
@@ -1277,11 +1329,11 @@ def _validate_image_readable(path: str) -> None:
 
 
 def process_image_chunk(
-    chunk: List[tuple[int, str, Optional[str]]], language: str
+    chunk: List[tuple[int, str, Optional[str], Optional[str]]], language: str
 ) -> Dict[int, dict]:
     """Obradi do GEMINI_IMAGES_PER_REQUEST slika kroz JEDAN Gemini zahtjev.
 
-    `chunk`: [(global_idx, image_path, source_path), ...]
+    `chunk`: [(global_idx, image_path, source_path, image_hash), ...]
     Vraća {global_idx: {"ok": entry} | {"error": poruka}}.
 
     Slika za koju Gemini nije vratio jasan index (vidi
@@ -1295,37 +1347,40 @@ def process_image_chunk(
     ispravne slike iz istog zahtjeva).
     """
     out: Dict[int, dict] = {}
-    prepared: List[tuple[int, str, Optional[str]]] = []
-    for gidx, path, src in chunk:
+    prepared: List[tuple[int, str, Optional[str], Optional[str]]] = []
+    for gidx, path, src, image_hash in chunk:
         used_path = prepare_image_for_gemini(path)
         try:
             _validate_image_readable(used_path)
         except Exception as exc:
             out[gidx] = {"error": f"Slika je neispravna i preskočena: {exc}"}
             continue
-        prepared.append((gidx, used_path, src))
+        prepared.append((gidx, used_path, src, image_hash))
 
     if not prepared:
         return out
 
-    batch_payloads = call_gemini_vision_batch_parser([p for _, p, _ in prepared])
+    batch_payloads = call_gemini_vision_batch_parser([p for _, p, _, _ in prepared])
 
-    for local_i, (gidx, used_path, src) in enumerate(prepared):
+    for local_i, (gidx, used_path, src, image_hash) in enumerate(prepared):
         llm_payload = batch_payloads.get(local_i)
         if llm_payload is None:
             out[gidx] = {"error": "Gemini nije vratio rezultat za ovu sliku u ovom batchu"}
             continue
-        receipt = _build_receipt_data_from_payload(llm_payload, used_path, language)
+        receipt = _build_receipt_data_from_payload(llm_payload, used_path, language, image_hash=image_hash)
         out[gidx] = {"ok": _package_processed_entry(used_path, receipt, src)}
     return out
 
 
 def process_images_batch(
-    jobs: List[tuple[str, Optional[str]]],
+    jobs: List[tuple[str, Optional[str], Optional[str]]],
     language: str,
     on_status: Optional[Callable[[int, str, Optional[str]], None]] = None,
 ) -> tuple[List[dict], List[str]]:
     """Vraća (uspješni_rezultati, lista_grešaka).
+
+    `jobs`: [(image_path, source_path, image_hash), ...] — image_hash je sha256
+    izvornih bajtova (izračunat prije ove funkcije, prije bilo kakve obrade slike).
 
     `on_status(idx, status, error)` je opcionalni callback (status je
     "processing" | "done" | "error") kojim pozivatelj može pratiti napredak
@@ -1342,7 +1397,10 @@ def process_images_batch(
     indexed_jobs = list(enumerate(jobs))
     chunk_size = max(1, GEMINI_IMAGES_PER_REQUEST)
     chunks = [
-        [(gidx, path, source_path) for gidx, (path, source_path) in indexed_jobs[i : i + chunk_size]]
+        [
+            (gidx, path, source_path, image_hash)
+            for gidx, (path, source_path, image_hash) in indexed_jobs[i : i + chunk_size]
+        ]
         for i in range(0, len(indexed_jobs), chunk_size)
     ]
 
@@ -1352,13 +1410,13 @@ def process_images_batch(
     daily_quota_hit = threading.Event()
     quota_reason = ""
 
-    def process_chunk_job(chunk: List[tuple[int, str, Optional[str]]]) -> Dict[int, dict]:
+    def process_chunk_job(chunk: List[tuple[int, str, Optional[str], Optional[str]]]) -> Dict[int, dict]:
         """Circuit breaker: kad je dnevna kvota potrošena, preostali chunkovi odmah odustaju."""
         nonlocal quota_reason
         if daily_quota_hit.is_set():
             raise GeminiDailyQuotaExceeded(quota_reason or "preskočeno zbog dnevne kvote")
         if on_status:
-            for gidx, _path, _src in chunk:
+            for gidx, _path, _src, _hash in chunk:
                 on_status(gidx, "processing", None)
         try:
             return process_image_chunk(chunk, language)
@@ -1389,14 +1447,14 @@ def process_images_batch(
                             on_status(gidx, "error", outcome["error"])
             except GeminiDailyQuotaExceeded as exc:
                 error_text = f"dnevna kvota ({exc.reason})"
-                for gidx, _path, _src in chunk:
+                for gidx, _path, _src, _hash in chunk:
                     failed_file = os.path.basename(jobs[gidx][0])
                     errors.append(f"{failed_file}: {error_text}")
                     if on_status:
                         on_status(gidx, "error", error_text)
             except Exception as exc:
                 log_progress(f"Greška pri obradi chunka: {exc}")
-                for gidx, _path, _src in chunk:
+                for gidx, _path, _src, _hash in chunk:
                     failed_file = os.path.basename(jobs[gidx][0])
                     errors.append(f"{failed_file}: {exc}")
                     if on_status:
@@ -1424,13 +1482,20 @@ def _cleanup_expired_batches() -> None:
 
 
 def _create_batch(
-    jobs: List[tuple[str, Optional[str]]], lang: str, model: str, stored_verb: str
+    jobs: List[tuple[str, Optional[str], Optional[str]]],
+    lang: str,
+    model: str,
+    stored_verb: str,
+    duplicates: Optional[List[dict]] = None,
 ) -> str:
+    """`duplicates`: datoteke izbačene PRIJE OCR-a jer im je hash već u bazi —
+    prikazuju se odvojeno na /batch/<id> (vidi BATCH_STATUS_TEMPLATE), nisu dio
+    `jobs`/`files` liste pa ne ometaju idx-adresiranje u on_status callbacku."""
     _cleanup_expired_batches()
     batch_id = uuid4().hex
     files = [
         {"idx": idx, "name": os.path.basename(path), "status": "queued", "error": None}
-        for idx, (path, _source) in enumerate(jobs)
+        for idx, (path, _source, _hash) in enumerate(jobs)
     ]
     with _upload_batches_lock:
         _upload_batches[batch_id] = {
@@ -1440,6 +1505,7 @@ def _create_batch(
             "model": model,
             "stored_verb": stored_verb,
             "files": files,
+            "duplicates": duplicates or [],
             "status": "running",
             "processed_entries": None,
             "batch_errors": None,
@@ -1479,7 +1545,7 @@ def _pop_batch(batch_id: str) -> Optional[dict]:
 
 
 def _run_batch_in_background(
-    batch_id: str, jobs: List[tuple[str, Optional[str]]], lang: str
+    batch_id: str, jobs: List[tuple[str, Optional[str], Optional[str]]], lang: str
 ) -> None:
     def on_status(idx: int, status: str, error: Optional[str] = None) -> None:
         _set_batch_status(batch_id, idx, status, error)
@@ -1490,6 +1556,61 @@ def _run_batch_in_background(
         log_progress(f"Batch {batch_id} neočekivano pukao: {exc}")
         processed_entries, batch_errors = [], [str(exc)]
     _finish_batch(batch_id, processed_entries, batch_errors)
+
+
+def _start_batch_or_redirect(
+    upload_jobs: List[tuple[str, Optional[str], Optional[str]]],
+    duplicate_notices: List[dict],
+    upload_lang: str,
+    upload_model: str,
+    stored_verb: str,
+):
+    """Zajednička logika za /upload i /import_onedrive nakon što su datoteke
+    spremljene/kopirane na disk i podijeljene po image_hash provjeri u:
+    `upload_jobs` (idu na OCR) i `duplicate_notices` (bajt-identične već
+    postojećem računu, preskočene PRIJE OCR-a).
+
+    - Točno jedna poslana datoteka i ta je duplikat -> direktno na tu postojeću
+      /receipt/<id> stranicu (nema smisla prikazivati prazan batch UI).
+    - Ima nešto za OCR -> normalan batch u pozadini; duplikati (ako ih ima) se
+      prikazuju uz njega na /batch/<id>.
+    - Sve je duplikat (upload_jobs prazan, a duplicate_notices nije) -> batch
+      se odmah označi gotovim (bez pozadinske dretve), redirect i dalje ide na
+      /batch/<id> da korisnik vidi popis s linkovima na postojeće račune.
+    """
+    if not upload_jobs and len(duplicate_notices) == 1:
+        return redirect(url_for("receipt_detail", receipt_id=duplicate_notices[0]["receipt_id"]))
+
+    batch_id = _create_batch(
+        upload_jobs, upload_lang, upload_model, stored_verb, duplicates=duplicate_notices
+    )
+    if upload_jobs:
+        threading.Thread(
+            target=_run_batch_in_background,
+            args=(batch_id, upload_jobs, upload_lang),
+            daemon=True,
+        ).start()
+    else:
+        _finish_batch(batch_id, [], [])
+    return redirect(url_for("upload_batch_status", batch_id=batch_id))
+
+
+def _delete_onedrive_source(source_path: str) -> None:
+    """Obriši originalnu datoteku (source_path) iz OneDrive foldera, ako postoji.
+
+    Koristi se i kad je uvezeni račun uspješno spremljen, i kad je odbačen —
+    u oba slučaja ne želimo da se ista datoteka ponovno uveze (i reprocesira)
+    kod sljedećeg /import_onedrive. Za obične uploade source_path je prazan.
+    """
+    if not source_path:
+        return
+    abs_source = os.path.abspath(source_path)
+    try:
+        if os.path.exists(abs_source):
+            os.remove(abs_source)
+            log_progress(f"Obrisan originalni OneDrive fajl: {abs_source}")
+    except OSError as exc:
+        log_progress(f"Ne mogu obrisati izvorni OneDrive fajl '{abs_source}': {exc}")
 
 
 def batch_failure_message(batch_errors: List[str], image_count: int, stored_verb: str) -> str:
@@ -1505,16 +1626,19 @@ def batch_failure_message(batch_errors: List[str], image_count: int, stored_verb
     return "Nijedna slika nije uspješno obrađena."
 
 
-def render_review_page(
-    processed_entries: List[dict],
-    batch_errors: List[str],
+def _render_pending_entry_page(
+    entry: dict,
+    pending_payloads: List[dict],
     upload_lang: str,
     upload_model: str,
+    extra_progress: Optional[List[str]] = None,
 ) -> str:
-    """Prikaži prvi obrađeni račun za pregled; ostali čekaju u pending listi."""
-    first_entry = processed_entries[0]
-    pending_entries = processed_entries[1:]
-    preview_image_path = first_entry["preview_path"]
+    """Prikaži jedan već-obrađen (ali još nespremljen) račun za review.
+
+    Dijeljeno između: prvog prikaza review stranice nakon batcha, i nastavka
+    na sljedeći pending račun nakon što je korisnik spremio ili odbacio prethodni.
+    """
+    preview_image_path = entry.get("preview_path", entry["image_path"])
 
     preview_image_mtime = None
     if preview_image_path and os.path.exists(preview_image_path):
@@ -1526,31 +1650,59 @@ def render_review_page(
         else None
     )
 
-    progress = list(first_entry["progress"])
-    if batch_errors:
-        progress.append(f"⚠ Neuspjelo ({len(batch_errors)}): " + "; ".join(batch_errors))
+    progress = list(entry.get("progress", []))
+    if extra_progress:
+        progress.extend(extra_progress)
 
     return render_template_string(
         DETAIL_TEMPLATE,
-        receipt={"id": None, "image_path": first_entry["image_path"]},
-        data=first_entry["payload"],
-        items=first_entry["payload"]["items"],
+        receipt={"id": None, "image_path": entry["image_path"]},
+        data=entry["payload"],
+        items=entry["payload"]["items"],
         saved=False,
         is_new=True,
-        image_path=first_entry["image_path"],
+        image_path=entry["image_path"],
         preview_image_path=preview_image_path,
         preview_image_mtime=preview_image_mtime,
-        base_payload=first_entry["payload"],
+        base_payload=entry["payload"],
         progress=progress,
         default_lang=upload_lang,
         default_model=upload_model,
-        pending_payloads=pending_entries,
-        pending_count=len(pending_entries),
+        pending_payloads=pending_payloads,
+        pending_count=len(pending_payloads),
         rotate_target=rotate_target,
         current_url=request.url,
         format_date=_format_date_for_display,
         form_error=None,
-        source_path=first_entry.get("source_path"),
+        source_path=entry.get("source_path"),
+    )
+
+
+def _render_next_pending_entry(
+    pending_payloads: List[dict], upload_lang: str, upload_model: str
+) -> str:
+    """Skida sljedeći račun s pending liste (in-place) i prikazuje ga za review."""
+    next_entry = pending_payloads.pop(0)
+    resize_image(next_entry["image_path"])
+    return _render_pending_entry_page(next_entry, pending_payloads, upload_lang, upload_model)
+
+
+def render_review_page(
+    processed_entries: List[dict],
+    batch_errors: List[str],
+    upload_lang: str,
+    upload_model: str,
+) -> str:
+    """Prikaži prvi obrađeni račun za pregled; ostali čekaju u pending listi."""
+    first_entry = processed_entries[0]
+    pending_entries = processed_entries[1:]
+
+    extra_progress = []
+    if batch_errors:
+        extra_progress.append(f"⚠ Neuspjelo ({len(batch_errors)}): " + "; ".join(batch_errors))
+
+    return _render_pending_entry_page(
+        first_entry, pending_entries, upload_lang, upload_model, extra_progress
     )
 
 
@@ -1741,7 +1893,8 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             )
 
         # --- Obrada uploadanih slika ---
-        upload_jobs: List[tuple[str, Optional[str]]] = []
+        upload_jobs: List[tuple[str, Optional[str], Optional[str]]] = []
+        duplicate_notices: List[dict] = []
         for upload_file in upload_files:
             original_name = secure_filename(upload_file.filename)
             if not original_name:
@@ -1757,15 +1910,28 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
 
             temp_path = os.path.join(upload_dir, filename)
             upload_file.save(temp_path)
-            upload_jobs.append((temp_path, None))
 
-        batch_id = _create_batch(upload_jobs, upload_lang, upload_model, "spremljeno")
-        threading.Thread(
-            target=_run_batch_in_background,
-            args=(batch_id, upload_jobs, upload_lang),
-            daemon=True,
-        ).start()
-        return redirect(url_for("upload_batch_status", batch_id=batch_id))
+            # Hash IZVORNIH bajtova (prije OCR obrade) — ako je bajt-identična slika
+            # već negdje spremljena kao račun, preskoči OCR i ne troši Gemini kvotu.
+            file_hash = _sha256_of_file(temp_path)
+            existing = find_receipt_by_hash(file_hash, db_path)
+            if existing:
+                os.remove(temp_path)
+                duplicate_notices.append(
+                    {
+                        "name": original_name,
+                        "receipt_id": existing["id"],
+                        "date": existing["date"],
+                        "total": existing["total"],
+                    }
+                )
+                continue
+
+            upload_jobs.append((temp_path, None, file_hash))
+
+        return _start_batch_or_redirect(
+            upload_jobs, duplicate_notices, upload_lang, upload_model, "spremljeno"
+        )
 
     @app.route("/import_onedrive", methods=["POST"])
     def import_onedrive() -> str:
@@ -1819,10 +1985,29 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         upload_dir = UPLOAD_DIR
         os.makedirs(upload_dir, exist_ok=True)
 
-        upload_jobs: List[tuple[str, Optional[str]]] = []
+        upload_jobs: List[tuple[str, Optional[str], Optional[str]]] = []
+        duplicate_notices: List[dict] = []
 
         for src_path in image_paths:
             original_name = secure_filename(os.path.basename(src_path)) or "receipt.png"
+
+            # Hash izvornika PRIJE kopiranja/OCR-a — ako je već uvezen, preskoči
+            # kopiranje u uploads/ i odmah očisti izvornik (inače bi se svaki
+            # sljedeći import ponovno "spotaknuo" o istu datoteku).
+            file_hash = _sha256_of_file(src_path)
+            existing = find_receipt_by_hash(file_hash, db_path)
+            if existing:
+                duplicate_notices.append(
+                    {
+                        "name": original_name,
+                        "receipt_id": existing["id"],
+                        "date": existing["date"],
+                        "total": existing["total"],
+                    }
+                )
+                _delete_onedrive_source(src_path)
+                continue
+
             name, ext = os.path.splitext(original_name)
             if not ext:
                 ext = ".png"
@@ -1833,15 +2018,11 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             temp_path = os.path.join(upload_dir, filename)
             # Kopiraj iz OneDrive foldera u uploads/
             shutil.copy2(src_path, temp_path)
-            upload_jobs.append((temp_path, src_path))
+            upload_jobs.append((temp_path, src_path, file_hash))
 
-        batch_id = _create_batch(upload_jobs, upload_lang, upload_model, "kopirano")
-        threading.Thread(
-            target=_run_batch_in_background,
-            args=(batch_id, upload_jobs, upload_lang),
-            daemon=True,
-        ).start()
-        return redirect(url_for("upload_batch_status", batch_id=batch_id))
+        return _start_batch_or_redirect(
+            upload_jobs, duplicate_notices, upload_lang, upload_model, "kopirano"
+        )
 
     @app.route("/batch/<batch_id>", methods=["GET"])
     def upload_batch_status(batch_id: str) -> str:
@@ -1854,7 +2035,8 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             BATCH_STATUS_TEMPLATE,
             batch_id=batch_id,
             files=batch["files"],
-            done=batch["status"] == "done",
+            duplicates=batch.get("duplicates") or [],
+            format_date=_format_date_for_display,
         )
 
     @app.route("/batch/<batch_id>/status.json", methods=["GET"])
@@ -1879,9 +2061,18 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         batch_errors = batch["batch_errors"] or []
 
         if not processed_entries:
-            error_msg = batch_failure_message(
-                batch_errors, len(batch["files"]), batch["stored_verb"]
-            )
+            duplicates = batch.get("duplicates") or []
+            if duplicates and not batch_errors:
+                # Sve slike u ovom batchu su prepoznate kao već uvezene (isti image_hash) —
+                # nema "greške", samo nema ničeg novog za pregled.
+                error_msg = (
+                    f"Sve {len(duplicates)} slika(e) su prepoznate kao već uvezene (identičan "
+                    f"sadržaj datoteke) — ništa novo za pregled."
+                )
+            else:
+                error_msg = batch_failure_message(
+                    batch_errors, len(batch["files"]), batch["stored_verb"]
+                )
             return redirect(url_for("index", error=error_msg))
 
         return render_review_page(
@@ -1947,51 +2138,47 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
 
         # Ako je ovaj račun uvezen iz OneDrive-a i sad je uspješno spremljen,
         # obriši originalnu datoteku (source_path) iz OneDrive foldera.
-        source_path = request.form.get("source_path") or ""
-        if source_path:
-            abs_source = os.path.abspath(source_path)
-            try:
-                if os.path.exists(abs_source):
-                    os.remove(abs_source)
-                    log_progress(f"Obrisan originalni OneDrive fajl: {abs_source}")
-            except OSError as exc:
-                log_progress(f"Ne mogu obrisati izvorni OneDrive fajl '{abs_source}': {exc}")
+        _delete_onedrive_source(request.form.get("source_path") or "")
 
 
         if pending_payloads:
-            next_entry = pending_payloads.pop(0)
-            resize_image(next_entry["image_path"])
-            rotate_target = next_entry["preview_path"] if next_entry.get("preview_path") and not next_entry["preview_path"].startswith("manual://") else None
-            preview_image_path = next_entry.get("preview_path", next_entry["image_path"])
-            preview_image_mtime = None
-            if preview_image_path and os.path.exists(preview_image_path):
-                preview_image_mtime = int(os.path.getmtime(preview_image_path))
-
-            return render_template_string(
-                DETAIL_TEMPLATE,
-                receipt={"id": None, "image_path": next_entry["image_path"]},
-                data=next_entry["payload"],
-                items=next_entry["payload"]["items"],
-                saved=False,
-                is_new=True,
-                image_path=next_entry["image_path"],
-                preview_image_path=preview_image_path,
-                preview_image_mtime=preview_image_mtime,
-                base_payload=next_entry["payload"],
-                progress=next_entry.get("progress", []),
-                default_lang=default_lang,
-                default_model=default_model,
-                pending_payloads=pending_payloads,
-                pending_count=len(pending_payloads),
-                rotate_target=rotate_target,
-                current_url=request.url,
-                format_date=_format_date_for_display,
-                form_error=None,
-                source_path=next_entry.get("source_path"),
-            )
+            return _render_next_pending_entry(pending_payloads, default_lang, default_model)
 
         if image_path and not image_path.startswith("manual://"):
             resize_image(image_path)
+        return redirect(url_for("index"))
+
+    @app.route("/receipt/discard_new", methods=["POST"])
+    def discard_new_receipt() -> str:
+        """Odbaci trenutni (još nespremljeni) račun iz review niza.
+
+        Račun se NE sprema u bazu, a njegova slika u uploads/ se briše s diska.
+        Ako je uvezen iz OneDrive-a, briše se i izvornik u OneDrive folderu
+        (isto kao kod uspješnog spremanja) — inače bi se kod sljedećeg importa
+        isti (npr. duplicirani ili neispravni) račun samo ponovno uvezao.
+        Koristi se kad je slika neispravna ili je isti račun već unesen (duplikat).
+        """
+        image_path = request.form.get("image_path") or ""
+        pending_payloads_raw = request.form.get("pending_payloads", "[]")
+        try:
+            pending_payloads = json.loads(pending_payloads_raw) if pending_payloads_raw else []
+        except json.JSONDecodeError:
+            pending_payloads = []
+
+        if image_path and not image_path.startswith("manual://"):
+            abs_path = os.path.abspath(image_path)
+            try:
+                if os.path.exists(abs_path):
+                    os.remove(abs_path)
+                    log_progress(f"Odbačen račun, obrisana slika: {abs_path}")
+            except OSError as exc:
+                log_progress(f"Ne mogu obrisati odbačenu sliku '{abs_path}': {exc}")
+
+        _delete_onedrive_source(request.form.get("source_path") or "")
+
+        if pending_payloads:
+            return _render_next_pending_entry(pending_payloads, default_lang, default_model)
+
         return redirect(url_for("index"))
 
     @app.route("/receipt/<int:receipt_id>/attach_image", methods=["POST"])
@@ -2018,6 +2205,9 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         saved_path = os.path.join(upload_dir, filename)
         upload_file.save(saved_path)
 
+        # Hash izvornih bajtova, prije nego što ih normalize/resize promijeni na disku.
+        file_hash = _sha256_of_file(saved_path)
+
         normalize_image_orientation(saved_path)
         saved_path = ensure_gemini_compatible_image(saved_path)
         resize_image(saved_path)
@@ -2027,8 +2217,8 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         conn = get_db_connection(db_path)
         try:
             conn.execute(
-                "UPDATE receipts SET image_path = ?, updated_at = ? WHERE id = ?",
-                (abs_path, datetime.now().isoformat(timespec="seconds"), receipt_id),
+                "UPDATE receipts SET image_path = ?, image_hash = ?, updated_at = ? WHERE id = ?",
+                (abs_path, file_hash, datetime.now().isoformat(timespec="seconds"), receipt_id),
             )
             conn.commit()
         finally:
@@ -2229,6 +2419,26 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             format_date=_format_date_for_display,
             form_error=None,
         )
+
+    @app.route("/receipt/<int:receipt_id>/delete", methods=["POST"])
+    def delete_receipt(receipt_id: int):
+        """Trajno briše spremljeni račun (i njegove stavke) te njegovu sliku s diska."""
+        row = fetch_receipt_record(receipt_id, db_path)
+        if row is None:
+            abort(404)
+
+        image_path = row["image_path"]
+        delete_receipt_record(receipt_id, db_path)
+
+        if image_path and not image_path.startswith(("manual://", "excel://")):
+            try:
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+                    log_progress(f"Obrisan račun #{receipt_id}, obrisana slika: {image_path}")
+            except OSError as exc:
+                log_progress(f"Ne mogu obrisati sliku obrisanog računa '{image_path}': {exc}")
+
+        return redirect(url_for("index"))
 
     return app
 
@@ -3428,9 +3638,24 @@ DETAIL_TEMPLATE = (
             <div class="actions">
               <button class="button button-secondary" type="button" id="add-item">Dodaj stavku</button>
               <button class="button button-primary" type="submit">Spremi promjene</button>
+              {% if is_new %}
+                <button class="button button-secondary" type="submit"
+                        formaction="{{ url_for('discard_new_receipt') }}"
+                        formnovalidate
+                        onclick="return confirm('Odbaci ovaj račun? Neće biti spremljen, a slika će biti trajno obrisana.');">
+                  Odbaci ovaj račun
+                </button>
+              {% endif %}
               <a class="button button-secondary" href="{{ url_for('index') }}">Natrag</a>
             </div>
           </form>
+          {% if receipt and receipt.id and not is_new %}
+            <form method="post" action="{{ url_for('delete_receipt', receipt_id=receipt.id) }}"
+                  onsubmit="return confirm('Trajno obrisati ovaj račun i njegovu sliku? Ova radnja se ne može poništiti.');"
+                  style="margin-top:0.6rem;">
+              <button class="button button-secondary" type="submit">Obriši račun</button>
+            </form>
+          {% endif %}
         </div>
       </div>
 
@@ -3804,13 +4029,44 @@ BATCH_STATUS_TEMPLATE = (
     <div class="page">
       <h1>Obrada računa</h1>
 
-      <div id="done-banner" class="alert alert-success" style="display:{{ 'block' if done else 'none' }};">
-        Obrada završena &mdash; preusmjeravam na pregled...
-      </div>
+      <div id="done-banner" class="alert alert-success" style="display:none;"></div>
       <div id="expired-banner" class="alert alert-error" style="display:none;">
         Obrada je istekla ili nije pronađena. <a class="cell-link" href="{{ url_for('index') }}">Natrag na početnu.</a>
       </div>
 
+      {% if duplicates %}
+        <div class="card" style="margin-bottom:1rem;">
+          <div class="card-header">
+            <h2>Preskočeno &mdash; već postoji ({{ duplicates | length }})</h2>
+          </div>
+          <p class="small-text">
+            Ove slike su bajt-identične računu koji je već u bazi (isti sadržaj datoteke),
+            pa nisu ponovno slane na OCR. Nisu spremljene ni na koji drugi način.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Datoteka</th>
+                <th>Već spremljeno kao</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for dup in duplicates %}
+              <tr>
+                <td>{{ dup.name }}</td>
+                <td>
+                  <a class="cell-link" href="{{ url_for('receipt_detail', receipt_id=dup.receipt_id) }}">
+                    Račun #{{ dup.receipt_id }}{% if dup.date %} &mdash; {{ format_date(dup.date) }}{% endif %}{% if dup.total is not none %} &mdash; {{ ('%.2f'|format(dup.total)).replace('.', ',') }} €{% endif %}
+                  </a>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% endif %}
+
+      {% if files %}
       <div class="card">
         <table>
           <thead>
@@ -3839,6 +4095,7 @@ BATCH_STATUS_TEMPLATE = (
           </tbody>
         </table>
       </div>
+      {% endif %}
 
       <script>
         const batchId = {{ batch_id | tojson }};
@@ -3880,10 +4137,19 @@ BATCH_STATUS_TEMPLATE = (
           if (data.done && !redirecting) {
             redirecting = true;
             clearInterval(timer);
-            document.getElementById("done-banner").style.display = "block";
-            setTimeout(function () {
-              window.location.href = "/batch/" + batchId + "/review";
-            }, 500);
+            const banner = document.getElementById("done-banner");
+            if (data.files.length > 0) {
+              banner.textContent = "Obrada završena — preusmjeravam na pregled...";
+              banner.style.display = "block";
+              setTimeout(function () {
+                window.location.href = "/batch/" + batchId + "/review";
+              }, 500);
+            } else {
+              // Sve slike su bile duplikati (preskočene prije OCR-a) — nema ništa
+              // novo za review, ostani na ovoj stranici (vidi popis iznad).
+              banner.textContent = "Obrada završena — nema ništa novo za pregled.";
+              banner.style.display = "block";
+            }
           }
         }
 
@@ -4023,7 +4289,9 @@ def _validate_receipt_payload(payload: dict, require_date: bool = False, require
     return None
 
 
-def _build_receipt_data_from_payload(llm_payload: dict, image_path: str, language: str) -> ReceiptData:
+def _build_receipt_data_from_payload(
+    llm_payload: dict, image_path: str, language: str, image_hash: Optional[str] = None
+) -> ReceiptData:
     items: List[ReceiptItem] = []
     for raw in llm_payload.get("items", []):
         raw = raw or {}
@@ -4055,13 +4323,14 @@ def _build_receipt_data_from_payload(llm_payload: dict, image_path: str, languag
         total=total_value,
         date=date_value,
         time=time_value,
+        image_hash=image_hash,
     )
 
 
-def build_receipt_data(image_path: str, language: str) -> ReceiptData:
+def build_receipt_data(image_path: str, language: str, image_hash: Optional[str] = None) -> ReceiptData:
     log_progress(f"Pokrećem Gemini Vision pipeline za {image_path}...")
     llm_payload = call_gemini_vision_parser(image_path)
-    return _build_receipt_data_from_payload(llm_payload, image_path, language)
+    return _build_receipt_data_from_payload(llm_payload, image_path, language, image_hash=image_hash)
 
 
 
@@ -4086,6 +4355,7 @@ def receipt_from_payload(payload: dict) -> ReceiptData:
         date=_clean_string(payload.get("date")),
         time=_clean_string(payload.get("time")),
         warranty=bool(payload.get("warranty")),
+        image_hash=_clean_string(payload.get("image_hash")),
     )
 
 
@@ -4274,8 +4544,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     try:
+        # Hash izvornih bajtova, prije nego što prepare_image_for_gemini nešto promijeni na disku.
+        image_hash = _sha256_of_file(image_path)
         prepared_image = prepare_image_for_gemini(image_path)
-        receipt = build_receipt_data(prepared_image, args.lang)
+        receipt = build_receipt_data(prepared_image, args.lang, image_hash=image_hash)
     except RuntimeError as exc:
         print(f"Gemini obrada nije uspjela: {exc}", file=sys.stderr)
         return 2
