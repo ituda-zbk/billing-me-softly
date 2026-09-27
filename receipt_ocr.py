@@ -1570,17 +1570,14 @@ def _start_batch_or_redirect(
     `upload_jobs` (idu na OCR) i `duplicate_notices` (bajt-identične već
     postojećem računu, preskočene PRIJE OCR-a).
 
-    - Točno jedna poslana datoteka i ta je duplikat -> direktno na tu postojeću
-      /receipt/<id> stranicu (nema smisla prikazivati prazan batch UI).
-    - Ima nešto za OCR -> normalan batch u pozadini; duplikati (ako ih ima) se
-      prikazuju uz njega na /batch/<id>.
-    - Sve je duplikat (upload_jobs prazan, a duplicate_notices nije) -> batch
-      se odmah označi gotovim (bez pozadinske dretve), redirect i dalje ide na
-      /batch/<id> da korisnik vidi popis s linkovima na postojeće račune.
+    Uvijek ide na /batch/<id> — bez obzira ima li tamo išta za OCR:
+    - Ima nešto za OCR -> normalan batch u pozadini; duplikati (ako ih ima,
+      bio to jedan ili više) prikazuju se uz njega kao "Preskočeno — već
+      postoji" popis s linkovima na postojeće račune.
+    - Sve je duplikat (upload_jobs prazan, a duplicate_notices nije, bio to
+      jedan ili više) -> batch se odmah označi gotovim (bez pozadinske
+      dretve), a /batch/<id> pokaže isti taj popis, samo bez OCR tablice.
     """
-    if not upload_jobs and len(duplicate_notices) == 1:
-        return redirect(url_for("receipt_detail", receipt_id=duplicate_notices[0]["receipt_id"]))
-
     batch_id = _create_batch(
         upload_jobs, upload_lang, upload_model, stored_verb, duplicates=duplicate_notices
     )
