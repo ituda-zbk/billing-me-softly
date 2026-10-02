@@ -1703,6 +1703,33 @@ def render_review_page(
     )
 
 
+_ONEDRIVE_IMPORTABLE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".heic", ".tif", ".tiff"}
+
+
+def _count_importable_onedrive_files(source_dir: Optional[str]) -> Optional[int]:
+    """Broj slikovnih datoteka spremnih za uvoz u zadanom folderu, ili None ako
+    folder nije zadan / ne postoji / nije čitljiv. Dijeljeno između početne
+    stranice (index) i /onedrive_status.json live-brojača."""
+    if not source_dir:
+        return None
+    abs_source = os.path.abspath(source_dir)
+    if not os.path.isdir(abs_source):
+        return None
+    try:
+        count = 0
+        for entry in os.listdir(abs_source):
+            full_path = os.path.join(abs_source, entry)
+            if not os.path.isfile(full_path):
+                continue
+            _, ext = os.path.splitext(entry)
+            if ext.lower() in _ONEDRIVE_IMPORTABLE_EXTS:
+                count += 1
+        return count
+    except OSError as exc:
+        log_progress(f"Ne mogu pročitati OneDrive folder '{abs_source}': {exc}")
+        return None
+
+
 def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
     app = Flask(__name__)
 
@@ -1755,25 +1782,7 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
         else:
             selected_year = datetime.now().year
         category_summary, monthly_totals = category_month_summary(db_path, selected_year)
-                # --- Statistika za OneDrive folder (broj slikovnih datoteka) ---
-        onedrive_total_files = None
-        if ONEDRIVE_IMPORT_DIR:
-            abs_source = os.path.abspath(ONEDRIVE_IMPORT_DIR)
-            if os.path.isdir(abs_source):
-                exts = {".png", ".jpg", ".jpeg", ".webp", ".heic", ".tif", ".tiff"}
-                try:
-                    count = 0
-                    for entry in os.listdir(abs_source):
-                        full_path = os.path.join(abs_source, entry)
-                        if not os.path.isfile(full_path):
-                            continue
-                        _, ext = os.path.splitext(entry)
-                        if ext.lower() in exts:
-                            count += 1
-                    onedrive_total_files = count
-                except OSError as exc:
-                    log_progress(f"Ne mogu pročitati OneDrive folder '{abs_source}': {exc}")
-                    onedrive_total_files = None
+        onedrive_total_files = _count_importable_onedrive_files(ONEDRIVE_IMPORT_DIR)
 
         return render_template_string(
             INDEX_TEMPLATE,
@@ -1795,6 +1804,15 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
             onedrive_total_files=onedrive_total_files,
             onedrive_import_limit=MAX_UPLOAD_FILES,
         )
+
+    @app.route("/onedrive_status.json", methods=["GET"])
+    def onedrive_status():
+        """Lagani live-brojač slika spremnih za uvoz (poll-a ga dashboard
+        svake par sekundi da ne mora reloadati cijelu stranicu — vidi
+        INDEX_TEMPLATE skriptu uz 'Učitaj slike računa iz foldera')."""
+        path = request.args.get("path") or ONEDRIVE_IMPORT_DIR or ""
+        count = _count_importable_onedrive_files(path)
+        return jsonify({"count": count})
 
     @app.route("/category_items", methods=["GET"])
     def category_items() -> str:
@@ -3138,23 +3156,53 @@ INDEX_TEMPLATE = (
     </form>
     <form action="{{ url_for('import_onedrive') }}" method="post" class="panel-form">
       <label style="align-self:center;">Učitaj slike računa iz foldera:</label>
-      <input type="text" name="onedrive_path" value="{{ onedrive_default_path or '' }}"
+      <input type="text" name="onedrive_path" id="onedrive-path-input" value="{{ onedrive_default_path or '' }}"
              placeholder="npr. /home/ituda/OneDrive/Racuni" style="flex:1;" />
       <button class="button button-primary" type="submit">Uvezi</button>
       <p class="small-text" style="flex-basis:100%; margin:0;">
         Učitava maksimalno {{ onedrive_import_limit }} slikovnih datoteka (.png, .jpg, .jpeg, .webp, .heic, .tif, .tiff) iz zadane putanje po jednom kliku.
       </p>
-      {% if onedrive_default_path and onedrive_total_files is not none %}
-        <p class="small-text" style="flex-basis:100%; margin:0;">
-          Trenutno u folderu <code>{{ onedrive_default_path }}</code> ima
-          <strong>{{ onedrive_total_files }}</strong> slikovnih datoteka.
-          To znači da će biti potrebno
-          <strong>{{ (onedrive_total_files // onedrive_import_limit) + (1 if (onedrive_total_files % onedrive_import_limit) > 0 else 0) }}</strong>
-          uvoza da obradiš sve račune (ako se broj ne mijenja tijekom obrade).
-        </p>
-      {% endif %}
-
+      <p class="small-text" id="onedrive-status-text" style="flex-basis:100%; margin:0;{% if not (onedrive_default_path and onedrive_total_files is not none) %} display:none;{% endif %}">
+        Trenutno u folderu <code id="onedrive-status-path">{{ onedrive_default_path or '' }}</code> ima
+        <strong id="onedrive-file-count">{{ onedrive_total_files if onedrive_total_files is not none else 0 }}</strong> slikovnih datoteka.
+        To znači da će biti potrebno
+        <strong id="onedrive-import-batches">{{ ((onedrive_total_files // onedrive_import_limit) + (1 if (onedrive_total_files % onedrive_import_limit) > 0 else 0)) if onedrive_total_files else 0 }}</strong>
+        uvoza da obradiš sve račune (ako se broj ne mijenja tijekom obrade).
+      </p>
     </form>
+    <script>
+      // Live-brojač slika u OneDrive folderu, bez reloada cijele stranice
+      // (poll-a /onedrive_status.json svake 3s i mijenja samo ovaj panel).
+      (function () {
+        var pathInput = document.getElementById('onedrive-path-input');
+        var statusText = document.getElementById('onedrive-status-text');
+        var pathLabel = document.getElementById('onedrive-status-path');
+        var countEl = document.getElementById('onedrive-file-count');
+        var batchesEl = document.getElementById('onedrive-import-batches');
+        if (!pathInput || !statusText || !countEl || !batchesEl) return;
+        var limit = {{ onedrive_import_limit }};
+
+        function refreshOnedriveCount() {
+          var path = pathInput.value.trim();
+          if (!path) {
+            statusText.style.display = 'none';
+            return;
+          }
+          fetch('/onedrive_status.json?path=' + encodeURIComponent(path))
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+              if (data.count === null || data.count === undefined) return;
+              pathLabel.textContent = path;
+              countEl.textContent = data.count;
+              batchesEl.textContent = Math.floor(data.count / limit) + (data.count % limit > 0 ? 1 : 0);
+              statusText.style.display = '';
+            })
+            .catch(function () { /* tiho ignoriraj mrežne greške, zadrži zadnju vrijednost */ });
+        }
+
+        setInterval(refreshOnedriveCount, 3000);
+      })();
+    </script>
 
     {% if category_summary %}
       <h2 id="categories-section">Pregled kategorija po godini
