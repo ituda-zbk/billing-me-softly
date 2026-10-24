@@ -89,7 +89,9 @@ Your data is stored locally. The one exception: receipt images are sent to Googl
 
 ## Expense categories
 
-Hrana, Cigarete/alkohol/kave, Kućne potrepštine, Kućni ljubimci, Lijekovi/troškovi liječenja, Odjeća i obuća, Škola i dječje aktivnosti, Sport, Automobili, Osiguranja, Internet/mobitel/TV, Struja, Voda, Plin, Smeće, Komunalni doprinos, Vodni doprinos, Putovanja/izleti/ručkovi, Ostalo.
+Namirnice, Kava/piće/duhan, Dom i kućanstvo, Ljubimci, Zdravlje, Odjeća i obuća, Djeca i obrazovanje, Sport i rekreacija, Prijevoz, Osiguranje, Telekom i pretplate, Struja, Voda, Plin, Odvoz otpada, Komunalna naknada, Naknada za vode, Slobodno vrijeme, Ostalo.
+
+Each category has a longer description (shown as a tooltip in the UI and sent to Gemini to guide classification).
 
 ## Contributing
 

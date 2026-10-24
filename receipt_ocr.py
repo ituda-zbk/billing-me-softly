@@ -24,7 +24,7 @@ from PIL import Image, ImageOps
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, Response, request, redirect, url_for, render_template_string, send_file, abort, jsonify
-from markupsafe import Markup
+from markupsafe import Markup, escape
 from werkzeug.utils import secure_filename
 from config import (
     MAX_NEW_TOKENS,
@@ -74,6 +74,114 @@ PRAVILA ZA DATUM:
 """.strip()
 
 
+# Kategorije troškova: (naziv, opis). Jedini izvor istine za Gemini prompt,
+# dashboard, padajuće izbornike na računu, ikone i tooltipove. Baza sprema
+# doslovni naziv, pa preimenovanje traži i unos u LEGACY_CATEGORY_RENAMES
+# (migracija postojećih stavki u init_db()). Opisi ne smiju sadržavati
+# vitičaste zagrade jer pravila idu kroz str.format() batch predloška.
+CATEGORIES = [
+    ("Namirnice",
+     "Hrana i bezalkoholna pića kupljena u trgovini, pekari, mesnici ili na tržnici: "
+     "kruh, mlijeko, meso, voće i povrće, slatkiši, grickalice, kava i čaj za kuću, voda i sokovi."),
+    ("Kava, piće i duhan",
+     "Kava i pića popijena u kafiću ili baru, alkoholna pića kupljena bilo gdje (pivo, vino, žestice), "
+     "cigarete, duhan, e-cigarete i punjenja."),
+    ("Dom i kućanstvo",
+     "Potrošni materijal za kućanstvo (sredstva za čišćenje i pranje, toaletni papir, higijena i kozmetika, "
+     "vrećice, žarulje, baterije) te dom i održavanje: popravci, alat, građevinski materijal, namještaj, "
+     "kućanski aparati, posuđe, vrt, usluge majstora."),
+    ("Ljubimci",
+     "Sve za kućne ljubimce: hrana i poslastice, pijesak, oprema i igračke, veterinar, cijepljenje, "
+     "lijekovi za životinje, šišanje, čuvanje."),
+    ("Zdravlje",
+     "Lijekovi i dodaci prehrani iz ljekarne, participacije, liječnički pregledi i privatne ordinacije, "
+     "stomatolog, laboratorij, fizioterapija, optika (naočale, leće), medicinska pomagala."),
+    ("Odjeća i obuća",
+     "Odjeća, obuća, donje rublje, modni dodaci (torbe, remeni, nakit), popravak i kemijsko čišćenje "
+     "odjeće i obuće. Oprema za određeni sport ide u Sport i rekreacija."),
+    ("Djeca i obrazovanje",
+     "Vrtić, škola i fakultet (školarine, udžbenici, školski pribor, ekskurzije, produženi boravak, "
+     "školska kuhinja), dječje izvanškolske aktivnosti i treninzi, igračke te tečajevi i edukacije odraslih."),
+    ("Sport i rekreacija",
+     "Sportska oprema i obuća za sport, bicikli i oprema, teretana, bazen, članarine sportskih klubova "
+     "i rekreacije odraslih, najam terena, skijaške karte."),
+    ("Prijevoz",
+     "Gorivo i punjenje električnog auta, servis, dijelovi i gume, autopraonica, registracija i tehnički "
+     "pregled, parking, cestarine i vinjete, javni gradski prijevoz, taksi. Osiguranje vozila ide u Osiguranje."),
+    ("Osiguranje",
+     "Sve police osiguranja: obvezno (AO) i kasko osiguranje vozila, osiguranje stana ili kuće, životno, "
+     "dopunsko i dodatno zdravstveno, putno osiguranje."),
+    ("Telekom i pretplate",
+     "Internet, fiksni i mobilni telefon, bonovi, TV paketi i HRT pristojba, streaming servisi "
+     "(Netflix, Spotify, YouTube Premium, Disney+), pretplate na aplikacije, cloud i softver, "
+     "digitalne članarine i pretplate na novine."),
+    ("Struja",
+     "Računi za električnu energiju (HEP ili drugi opskrbljivač), akontacije i godišnji obračun."),
+    ("Voda",
+     "Računi za vodoopskrbu i odvodnju (voda, odvodnja, pročišćavanje otpadnih voda). "
+     "Naknada za uređenje voda (NUV) ide u Naknada za vode."),
+    ("Plin",
+     "Računi za plin: akontacije i obračun prirodnog plina, plinske boce."),
+    ("Odvoz otpada",
+     "Računi za odvoz i zbrinjavanje komunalnog otpada, službene vrećice za otpad, odvoz glomaznog otpada."),
+    ("Komunalna naknada",
+     "Komunalna naknada koju grad ili općina naplaćuje za stan, kuću, garažu ili poslovni prostor "
+     "(obično u ratama), te jednokratni komunalni doprinos pri gradnji ili legalizaciji."),
+    ("Naknada za vode",
+     "Naknada za uređenje voda (NUV) i ostale državne vodne naknade, najčešće na zasebnim uplatnicama "
+     "u ratama, te jednokratni vodni doprinos pri gradnji."),
+    ("Slobodno vrijeme",
+     "Putovanja i odmor (smještaj, karte za put, ture), izleti, restorani, ručkovi i večere vani "
+     "(uključujući pića uz obrok), dostava hrane, kino, kazalište, koncerti, muzeji, knjige, hobiji, "
+     "ulaznice za događanja."),
+    ("Ostalo",
+     "Pokloni i darovi, donacije, upravne pristojbe i takse, bankovne naknade i sve što ne pripada "
+     "nijednoj drugoj kategoriji."),
+]
+CATEGORY_NAMES = [name for name, _ in CATEGORIES]
+CATEGORY_DESCRIPTIONS = dict(CATEGORIES)
+
+# Stari naziv -> novi naziv (preimenovanje kategorija 2026-10). Koristi se za
+# migraciju postojećih stavki u bazi i za normalizaciju odgovora modela.
+LEGACY_CATEGORY_RENAMES = {
+    "Hrana": "Namirnice",
+    "Cigarete, alkohol, kave,...": "Kava, piće i duhan",
+    "Kućne potrepštine": "Dom i kućanstvo",
+    "Kućni ljubimci": "Ljubimci",
+    "Lijekovi, troškovi liječenja": "Zdravlje",
+    "Škola i dječje aktivnosti": "Djeca i obrazovanje",
+    "Sport": "Sport i rekreacija",
+    "Automobili": "Prijevoz",
+    "Osiguranja": "Osiguranje",
+    "Internet/mobitel/TV": "Telekom i pretplate",
+    "Smeće": "Odvoz otpada",
+    "Komunalni doprinos": "Komunalna naknada",
+    "Vodni doprinos": "Naknada za vode",
+    "Putovanja, izleti, ručkovi": "Slobodno vrijeme",
+}
+
+
+def normalize_category(category: Optional[str]) -> Optional[str]:
+    """Stari naziv kategorije prevodi u novi; ostalo vraća nepromijenjeno."""
+    if category is None:
+        return None
+    return LEGACY_CATEGORY_RENAMES.get(category, category)
+
+
+_GEMINI_CATEGORY_ENUM = " | ".join(CATEGORY_NAMES)
+
+_GEMINI_CATEGORY_RULES = (
+    "PRAVILA ZA KATEGORIJU:\n"
+    "- \"category\" mora biti TOČNO jedan od ovih naziva, doslovno kako je napisan (s razmacima i velikim početnim slovom).\n"
+    "- Kategoriju biraj prema opisu ispod, za SVAKU stavku zasebno: jedan račun može imati stavke u više kategorija "
+    "(npr. trgovina: kruh u Namirnice, deterdžent u Dom i kućanstvo, pivo u Kava, piće i duhan).\n"
+    "- Na računu kafića ili restorana: kava i piće bez obroka idu u Kava, piće i duhan; jelo i pića uz obrok u Slobodno vrijeme.\n"
+    "- Ako nijedna kategorija ne odgovara, koristi Ostalo.\n"
+    "Kategorije:\n"
+    + "\n".join(f"- {name}: {description}" for name, description in CATEGORIES)
+)
+
+
 GEMINI_VISION_PROMPT = """
 Pročitaj račun sa slike i vrati isključivo valjani JSON bez markdowna.
 JSON shema:
@@ -81,7 +189,7 @@ JSON shema:
   "items": [
     {
       "description": string,
-      "category": "Hrana | Cigarete, alkohol, kave,... | Kućne potrepštine | Kućni ljubimci | Lijekovi, troškovi liječenja | Odjeća i obuća | Škola i dječje aktivnosti | Sport | Automobili | Osiguranja | Internet/mobitel/TV | Struja | Voda | Plin | Smeće | Komunalni doprinos | Vodni doprinos | Putovanja, izleti, ručkovi | Ostalo" | null,
+      "category": \"""" + _GEMINI_CATEGORY_ENUM + """\" | null,
       "quantity": number | null,
       "unit_price": number | null,
       "total_price": number | null
@@ -96,7 +204,7 @@ Pravila:
 - decimalne zareze pretvori u točku
 - nepoznate vrijednosti postavi na null
 
-""".lstrip() + _GEMINI_DATE_RULES
+""".lstrip() + _GEMINI_DATE_RULES + "\n\n" + _GEMINI_CATEGORY_RULES
 
 
 GEMINI_VISION_BATCH_PROMPT_TEMPLATE = """
@@ -112,7 +220,7 @@ Vrati isključivo valjani JSON bez markdowna, ove strukture:
       "items": [
         {{
           "description": string,
-          "category": "Hrana | Cigarete, alkohol, kave,... | Kućne potrepštine | Kućni ljubimci | Lijekovi, troškovi liječenja | Odjeća i obuća | Škola i dječje aktivnosti | Sport | Automobili | Osiguranja | Internet/mobitel/TV | Struja | Voda | Plin | Smeće | Komunalni doprinos | Vodni doprinos | Putovanja, izleti, ručkovi | Ostalo" | null,
+          "category": \"""" + _GEMINI_CATEGORY_ENUM + """\" | null,
           "quantity": number | null,
           "unit_price": number | null,
           "total_price": number | null
@@ -131,6 +239,8 @@ Pravila:
 - datum određuj za SVAKU sliku zasebno, samo iz te slike
 
 {date_rules}
+
+{category_rules}
 """.strip()
 
 
@@ -231,8 +341,24 @@ def init_db(db_path: str) -> None:
         conn.commit()
 
         _migrate_legacy_data_json(conn)
+        _migrate_category_names(conn)
     finally:
         conn.close()
+
+
+def _migrate_category_names(conn: sqlite3.Connection) -> None:
+    """Preimenuje stare nazive kategorija u receipt_items prema
+    LEGACY_CATEGORY_RENAMES. Idempotentno: kad starih naziva nema, ništa ne mijenja."""
+    changed = 0
+    for old_name, new_name in LEGACY_CATEGORY_RENAMES.items():
+        cur = conn.execute(
+            "UPDATE receipt_items SET category = ? WHERE category = ?",
+            (new_name, old_name),
+        )
+        changed += cur.rowcount
+    conn.commit()
+    if changed:
+        log_progress(f"Migracija kategorija: preimenovano {changed} stavki na nove nazive kategorija.")
 
 
 def _migrate_legacy_data_json(conn: sqlite3.Connection) -> None:
@@ -462,13 +588,7 @@ def fetch_all_receipts(
 
 
 def category_month_summary(db_path: str, year: int) -> tuple[dict, List[float]]:
-    categories = [
-        "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Kućni ljubimci","Lijekovi, troškovi liječenja",
-        "Odjeća i obuća","Škola i dječje aktivnosti","Sport","Automobili","Osiguranja",
-        "Internet/mobitel/TV","Struja","Voda","Plin","Smeće","Komunalni doprinos",
-        "Vodni doprinos","Putovanja, izleti, ručkovi","Ostalo"
-    ]
-    summary = {category: [0.0] * 12 for category in categories}
+    summary = {category: [0.0] * 12 for category in CATEGORY_NAMES}
 
     conn = get_db_connection(db_path)
     try:
@@ -1237,7 +1357,9 @@ def call_gemini_vision_batch_parser(image_paths: List[str]) -> Dict[int, Optiona
     None, i pozivatelj je NIKAD ne smije spremiti kao uspješan rezultat.
     """
     n = len(image_paths)
-    batch_prompt = GEMINI_VISION_BATCH_PROMPT_TEMPLATE.format(n=n, date_rules=_GEMINI_DATE_RULES)
+    batch_prompt = GEMINI_VISION_BATCH_PROMPT_TEMPLATE.format(
+        n=n, date_rules=_GEMINI_DATE_RULES, category_rules=_GEMINI_CATEGORY_RULES
+    )
     parts = [{"text": batch_prompt}]
     parts.extend(_image_to_inline_part(p) for p in image_paths)
 
@@ -1737,6 +1859,9 @@ def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
     app.jinja_env.globals["category_icon_map"] = {
         name: str(category_icon(name)) for name in CATEGORY_ICONS
     }
+    app.jinja_env.globals["category_label"] = category_label
+    app.jinja_env.globals["category_names"] = CATEGORY_NAMES
+    app.jinja_env.globals["category_descriptions"] = CATEGORY_DESCRIPTIONS
 
     def _icon_response() -> Response:
         return Response(
@@ -2564,28 +2689,28 @@ _APP_ICON_PNG_B64 = (
 _APP_ICON_PNG = base64.b64decode(_APP_ICON_PNG_B64)
 
 # Ikone kategorija (unutarnji SVG elementi, viewBox 24x24, linijski stil).
-# Izvor: Lucide v0.460.0 (ISC licenca, https://lucide.dev), osim "Sport"
-# (tenisica) koja je nacrtana ručno u istom stilu jer je Lucide nema.
-# Ključevi su doslovni nazivi kategorija iz Gemini prompta / baze.
+# Izvor: Lucide v0.460.0 (ISC licenca, https://lucide.dev), osim "Sport i
+# rekreacija" (tenisica) koja je nacrtana ručno u istom stilu jer je Lucide nema.
+# Ključevi su doslovni nazivi iz CATEGORIES.
 CATEGORY_ICONS = {
-    "Hrana": '<path d="M12 20.94c1.5 0 2.75 1.06 4 1.06 3 0 6-8 6-12.22A4.91 4.91 0 0 0 17 5c-2.22 0-4 1.44-5 2-1-.56-2.78-2-5-2a4.9 4.9 0 0 0-5 4.78C2 14 5 22 8 22c1.25 0 2.5-1.06 4-1.06Z"/><path d="M10 2c1 .5 2 2 2 5"/>',
-    "Cigarete, alkohol, kave,...": '<path d="M10 2v2"/><path d="M14 2v2"/><path d="M16 8a1 1 0 0 1 1 1v8a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1h14a4 4 0 1 1 0 8h-1"/><path d="M6 2v2"/>',
-    "Kućne potrepštine": '<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
-    "Kućni ljubimci": '<circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/><path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/>',
-    "Lijekovi, troškovi liječenja": '<path d="m10.5 20.5 10-10a4.95 4.95 0 1 0-7-7l-10 10a4.95 4.95 0 1 0 7 7Z"/><path d="m8.5 8.5 7 7"/>',
+    "Namirnice": '<path d="M12 20.94c1.5 0 2.75 1.06 4 1.06 3 0 6-8 6-12.22A4.91 4.91 0 0 0 17 5c-2.22 0-4 1.44-5 2-1-.56-2.78-2-5-2a4.9 4.9 0 0 0-5 4.78C2 14 5 22 8 22c1.25 0 2.5-1.06 4-1.06Z"/><path d="M10 2c1 .5 2 2 2 5"/>',
+    "Kava, piće i duhan": '<path d="M10 2v2"/><path d="M14 2v2"/><path d="M16 8a1 1 0 0 1 1 1v8a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1h14a4 4 0 1 1 0 8h-1"/><path d="M6 2v2"/>',
+    "Dom i kućanstvo": '<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+    "Ljubimci": '<circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/><path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/>',
+    "Zdravlje": '<path d="m10.5 20.5 10-10a4.95 4.95 0 1 0-7-7l-10 10a4.95 4.95 0 1 0 7 7Z"/><path d="m8.5 8.5 7 7"/>',
     "Odjeća i obuća": '<path d="M20.38 3.46 16 2a4 4 0 0 1-8 0L3.62 3.46a2 2 0 0 0-1.34 2.23l.58 3.47a1 1 0 0 0 .99.84H6v10c0 1.1.9 2 2 2h8a2 2 0 0 0 2-2V10h2.15a1 1 0 0 0 .99-.84l.58-3.47a2 2 0 0 0-1.34-2.23z"/>',
-    "Škola i dječje aktivnosti": '<path d="M4 10a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M8 10h8"/><path d="M8 18h8"/><path d="M8 22v-6a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>',
-    "Sport": '<path d="M3 7h3l2 3 3-1 2.5 2.5 5.5 1.5a3 3 0 0 1 2 2.8V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1Z"/><path d="M3 16h18"/><path d="m9.5 12.5 1.5-1.5"/><path d="m12.5 14 1.5-1.5"/>',
-    "Automobili": '<path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/><circle cx="7" cy="17" r="2"/><path d="M9 17h6"/><circle cx="17" cy="17" r="2"/>',
-    "Osiguranja": '<path d="M22 12a10.06 10.06 1 0 0-20 0Z"/><path d="M12 12v8a2 2 0 0 0 4 0"/><path d="M12 2v1"/>',
-    "Internet/mobitel/TV": '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>',
+    "Djeca i obrazovanje": '<path d="M4 10a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M8 10h8"/><path d="M8 18h8"/><path d="M8 22v-6a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>',
+    "Sport i rekreacija": '<path d="M3 7h3l2 3 3-1 2.5 2.5 5.5 1.5a3 3 0 0 1 2 2.8V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1Z"/><path d="M3 16h18"/><path d="m9.5 12.5 1.5-1.5"/><path d="m12.5 14 1.5-1.5"/>',
+    "Prijevoz": '<path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/><circle cx="7" cy="17" r="2"/><path d="M9 17h6"/><circle cx="17" cy="17" r="2"/>',
+    "Osiguranje": '<path d="M22 12a10.06 10.06 1 0 0-20 0Z"/><path d="M12 12v8a2 2 0 0 0 4 0"/><path d="M12 2v1"/>',
+    "Telekom i pretplate": '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>',
     "Struja": '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
     "Voda": '<path d="M12 22a7 7 0 0 0 7-7c0-2-1-3.9-3-5.5s-3.5-4-4-6.5c-.5 2.5-2 4.9-4 6.5C6 11.1 5 13 5 15a7 7 0 0 0 7 7z"/>',
     "Plin": '<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>',
-    "Smeće": '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
-    "Komunalni doprinos": '<line x1="3" x2="21" y1="22" y2="22"/><line x1="6" x2="6" y1="18" y2="11"/><line x1="10" x2="10" y1="18" y2="11"/><line x1="14" x2="14" y1="18" y2="11"/><line x1="18" x2="18" y1="18" y2="11"/><polygon points="12 2 20 7 4 7"/>',
-    "Vodni doprinos": '<path d="M2 6c.6.5 1.2 1 2.5 1C7 7 7 5 9.5 5c2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/><path d="M2 12c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/><path d="M2 18c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/>',
-    "Putovanja, izleti, ručkovi": '<path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z"/>',
+    "Odvoz otpada": '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
+    "Komunalna naknada": '<line x1="3" x2="21" y1="22" y2="22"/><line x1="6" x2="6" y1="18" y2="11"/><line x1="10" x2="10" y1="18" y2="11"/><line x1="14" x2="14" y1="18" y2="11"/><line x1="18" x2="18" y1="18" y2="11"/><polygon points="12 2 20 7 4 7"/>',
+    "Naknada za vode": '<path d="M2 6c.6.5 1.2 1 2.5 1C7 7 7 5 9.5 5c2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/><path d="M2 12c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/><path d="M2 18c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/>',
+    "Slobodno vrijeme": '<path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"/><path d="M13 5v2"/><path d="M13 17v2"/><path d="M13 11v2"/>',
     "Ostalo": '<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M12 22V12"/><path d="m3.3 7 7.703 4.734a2 2 0 0 0 1.994 0L20.7 7"/><path d="m7.5 4.27 9 5.15"/>',
 }
 
@@ -2600,6 +2725,18 @@ def category_icon(category: Optional[str]) -> Markup:
         'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
         + inner
         + "</svg>"
+    )
+
+
+def category_label(category: Optional[str]) -> Markup:
+    """Ikona + naziv kategorije s tooltipom opisa (hover, ili dodir/fokus na
+    mobitelu) — Jinja global za dashboard tablicu kategorija."""
+    name = category or ""
+    description = CATEGORY_DESCRIPTIONS.get(name)
+    if not description:
+        return category_icon(name) + escape(name)
+    return Markup('<span class="cat-tip" tabindex="0" data-tip="{}">{}{}</span>').format(
+        description, category_icon(name), name
     )
 
 ICON_LINKS = """
@@ -2705,6 +2842,36 @@ BASE_STYLE = """
   .cat-cell { white-space: nowrap; }
   .cat-select { display: inline-flex; align-items: center; }
   .cat-select-icon { display: inline-flex; width: 1.55em; flex: none; }
+
+  /* Tooltip s opisom kategorije (data-tip): hover na desktopu, dodir/fokus na mobitelu */
+  .cat-tip { position: relative; cursor: help; outline: none; }
+  .cat-tip:focus-visible { outline: 1px dashed var(--ink-soft); outline-offset: 2px; }
+  .cat-tip::after {
+    content: attr(data-tip);
+    position: absolute;
+    left: 0;
+    top: calc(100% + 6px);
+    z-index: 50;
+    width: max-content;
+    max-width: min(22rem, 80vw);
+    padding: 0.55rem 0.7rem;
+    background: var(--ink);
+    color: var(--paper);
+    font: 400 0.8rem/1.45 var(--font-body);
+    letter-spacing: 0;
+    text-transform: none;
+    text-align: left;
+    white-space: normal;
+    border-radius: 4px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+    pointer-events: none;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.12s ease;
+  }
+  .cat-tip:hover::after,
+  .cat-tip:focus::after { opacity: 1; visibility: visible; }
+  .cat-tip[data-tip=""]::after { display: none; }
 
   .topbar-title {
     font-family: var(--font-display);
@@ -3293,7 +3460,7 @@ INDEX_TEMPLATE = (
         <tbody>
           {% for category, values in category_summary.items() %}
             <tr>
-              <td class="cat-cell">{{ category_icon(category) }}{{ category }}</td>
+              <td class="cat-cell">{{ category_label(category) }}</td>
                 {% for value in values %}
               <td class="amount-cell">
                 <a href="{{ url_for('category_items',
@@ -3731,15 +3898,11 @@ DETAIL_TEMPLATE = (
                   </td>
                   <td>
                     <span class="cat-select">
-                    <span class="cat-select-icon">{{ category_icon(item.category) }}</span>
-                    <select name="item-category">
-                      {% for option in [
-                        "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Kućni ljubimci","Lijekovi, troškovi liječenja",
-                        "Odjeća i obuća","Škola i dječje aktivnosti","Sport","Automobili","Osiguranja",
-                        "Internet/mobitel/TV","Struja","Voda","Plin","Smeće","Komunalni doprinos",
-                        "Vodni doprinos","Putovanja, izleti, ručkovi","Ostalo"
-                      ] %}
-                        <option value="{{ option }}" {% if item.category == option %}selected{% endif %}>
+                    <span class="cat-select-icon cat-tip" tabindex="0"
+                          data-tip="{{ category_descriptions.get(item.category, '') }}">{{ category_icon(item.category) }}</span>
+                    <select name="item-category" title="{{ category_descriptions.get(item.category, '') }}">
+                      {% for option in category_names %}
+                        <option value="{{ option }}" title="{{ category_descriptions[option] }}" {% if item.category == option %}selected{% endif %}>
                           {{ option }}
                         </option>
                       {% endfor %}
@@ -3854,15 +4017,11 @@ DETAIL_TEMPLATE = (
             <td><input type="text" name="item-description" /></td>
             <td>
               <span class="cat-select">
-              <span class="cat-select-icon">{{ category_icon("Hrana") }}</span>
-              <select name="item-category">
-                {% for option in [
-                  "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Kućni ljubimci","Lijekovi, troškovi liječenja",
-                  "Odjeća i obuća","Škola i dječje aktivnosti","Sport","Automobili","Osiguranja",
-                  "Internet/mobitel/TV","Struja","Voda","Plin","Smeće","Komunalni doprinos",
-                  "Vodni doprinos","Putovanja, izleti, ručkovi","Ostalo"
-                ] %}
-                  <option value="{{ option }}">{{ option }}</option>
+              <span class="cat-select-icon cat-tip" tabindex="0"
+                    data-tip="{{ category_descriptions[category_names[0]] }}">{{ category_icon(category_names[0]) }}</span>
+              <select name="item-category" title="{{ category_descriptions[category_names[0]] }}">
+                {% for option in category_names %}
+                  <option value="{{ option }}" title="{{ category_descriptions[option] }}">{{ option }}</option>
                 {% endfor %}
               </select>
               </span>
@@ -3886,12 +4045,18 @@ DETAIL_TEMPLATE = (
 
         document.addEventListener('DOMContentLoaded', recalcItemsSum);
 
-        // Ikona kategorije lijevo od padajućeg izbornika prati odabranu opciju
+        // Ikona i tooltip opisa lijevo od padajućeg izbornika prate odabranu kategoriju
         const CATEGORY_ICON_SVG = {{ category_icon_map|tojson }};
+        const CATEGORY_DESCRIPTIONS = {{ category_descriptions|tojson }};
 
         function syncCategoryIcon(select) {
+          const description = CATEGORY_DESCRIPTIONS[select.value] || '';
           const holder = select.parentElement.querySelector('.cat-select-icon');
-          if (holder) holder.innerHTML = CATEGORY_ICON_SVG[select.value] || '';
+          if (holder) {
+            holder.innerHTML = CATEGORY_ICON_SVG[select.value] || '';
+            holder.setAttribute('data-tip', description);
+          }
+          select.title = description;
         }
 
         document.addEventListener('change', function (event) {
@@ -4460,7 +4625,7 @@ def _build_receipt_data_from_payload(
             continue
         item = ReceiptItem(
             description=description,
-            category=_clean_string(raw.get("category")),
+            category=normalize_category(_clean_string(raw.get("category"))),
             quantity=_to_optional_float(raw.get("quantity")),
             unit_price=_to_optional_float(raw.get("unit_price")),
             total_price=_to_optional_float(raw.get("total_price")),
