@@ -24,6 +24,7 @@ from PIL import Image, ImageOps
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, Response, request, redirect, url_for, render_template_string, send_file, abort, jsonify
+from markupsafe import Markup
 from werkzeug.utils import secure_filename
 from config import (
     MAX_NEW_TOKENS,
@@ -1732,6 +1733,10 @@ def _count_importable_onedrive_files(source_dir: Optional[str]) -> Optional[int]
 
 def create_app(db_path: str, default_lang: str, default_model: str) -> Flask:
     app = Flask(__name__)
+    app.jinja_env.globals["category_icon"] = category_icon
+    app.jinja_env.globals["category_icon_map"] = {
+        name: str(category_icon(name)) for name in CATEGORY_ICONS
+    }
 
     def _icon_response() -> Response:
         return Response(
@@ -2558,6 +2563,45 @@ _APP_ICON_PNG_B64 = (
 )
 _APP_ICON_PNG = base64.b64decode(_APP_ICON_PNG_B64)
 
+# Ikone kategorija (unutarnji SVG elementi, viewBox 24x24, linijski stil).
+# Izvor: Lucide v0.460.0 (ISC licenca, https://lucide.dev), osim "Sport"
+# (tenisica) koja je nacrtana ručno u istom stilu jer je Lucide nema.
+# Ključevi su doslovni nazivi kategorija iz Gemini prompta / baze.
+CATEGORY_ICONS = {
+    "Hrana": '<path d="M12 20.94c1.5 0 2.75 1.06 4 1.06 3 0 6-8 6-12.22A4.91 4.91 0 0 0 17 5c-2.22 0-4 1.44-5 2-1-.56-2.78-2-5-2a4.9 4.9 0 0 0-5 4.78C2 14 5 22 8 22c1.25 0 2.5-1.06 4-1.06Z"/><path d="M10 2c1 .5 2 2 2 5"/>',
+    "Cigarete, alkohol, kave,...": '<path d="M10 2v2"/><path d="M14 2v2"/><path d="M16 8a1 1 0 0 1 1 1v8a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1h14a4 4 0 1 1 0 8h-1"/><path d="M6 2v2"/>',
+    "Kućne potrepštine": '<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+    "Kućni ljubimci": '<circle cx="11" cy="4" r="2"/><circle cx="18" cy="8" r="2"/><circle cx="20" cy="16" r="2"/><path d="M9 10a5 5 0 0 1 5 5v3.5a3.5 3.5 0 0 1-6.84 1.045Q6.52 17.48 4.46 16.84A3.5 3.5 0 0 1 5.5 10Z"/>',
+    "Lijekovi, troškovi liječenja": '<path d="m10.5 20.5 10-10a4.95 4.95 0 1 0-7-7l-10 10a4.95 4.95 0 1 0 7 7Z"/><path d="m8.5 8.5 7 7"/>',
+    "Odjeća i obuća": '<path d="M20.38 3.46 16 2a4 4 0 0 1-8 0L3.62 3.46a2 2 0 0 0-1.34 2.23l.58 3.47a1 1 0 0 0 .99.84H6v10c0 1.1.9 2 2 2h8a2 2 0 0 0 2-2V10h2.15a1 1 0 0 0 .99-.84l.58-3.47a2 2 0 0 0-1.34-2.23z"/>',
+    "Škola i dječje aktivnosti": '<path d="M4 10a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M8 10h8"/><path d="M8 18h8"/><path d="M8 22v-6a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>',
+    "Sport": '<path d="M3 7h3l2 3 3-1 2.5 2.5 5.5 1.5a3 3 0 0 1 2 2.8V18a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1Z"/><path d="M3 16h18"/><path d="m9.5 12.5 1.5-1.5"/><path d="m12.5 14 1.5-1.5"/>',
+    "Automobili": '<path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/><circle cx="7" cy="17" r="2"/><path d="M9 17h6"/><circle cx="17" cy="17" r="2"/>',
+    "Osiguranja": '<path d="M22 12a10.06 10.06 1 0 0-20 0Z"/><path d="M12 12v8a2 2 0 0 0 4 0"/><path d="M12 2v1"/>',
+    "Internet/mobitel/TV": '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>',
+    "Struja": '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
+    "Voda": '<path d="M12 22a7 7 0 0 0 7-7c0-2-1-3.9-3-5.5s-3.5-4-4-6.5c-.5 2.5-2 4.9-4 6.5C6 11.1 5 13 5 15a7 7 0 0 0 7 7z"/>',
+    "Plin": '<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>',
+    "Smeće": '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
+    "Komunalni doprinos": '<line x1="3" x2="21" y1="22" y2="22"/><line x1="6" x2="6" y1="18" y2="11"/><line x1="10" x2="10" y1="18" y2="11"/><line x1="14" x2="14" y1="18" y2="11"/><line x1="18" x2="18" y1="18" y2="11"/><polygon points="12 2 20 7 4 7"/>',
+    "Vodni doprinos": '<path d="M2 6c.6.5 1.2 1 2.5 1C7 7 7 5 9.5 5c2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/><path d="M2 12c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/><path d="M2 18c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 2.6 0 2.4 2 5 2 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/>',
+    "Putovanja, izleti, ručkovi": '<path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z"/>',
+    "Ostalo": '<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M12 22V12"/><path d="m3.3 7 7.703 4.734a2 2 0 0 0 1.994 0L20.7 7"/><path d="m7.5 4.27 9 5.15"/>',
+}
+
+
+def category_icon(category: Optional[str]) -> Markup:
+    """Inline <svg> ikona za kategoriju (Jinja global); prazno za nepoznatu."""
+    inner = CATEGORY_ICONS.get(category or "")
+    if not inner:
+        return Markup("")
+    return Markup(
+        '<svg class="cat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        + inner
+        + "</svg>"
+    )
+
 ICON_LINKS = """
     <link rel="icon" type="image/png" href="{{ url_for('app_icon') }}" />"""
 
@@ -2647,6 +2691,20 @@ BASE_STYLE = """
     height: 46px;
     border-radius: 11px;
   }
+
+  /* Ikona kategorije lijevo od naziva (vidi CATEGORY_ICONS / category_icon) */
+  .cat-icon {
+    display: inline-block;
+    width: 1.05em;
+    height: 1.05em;
+    margin-right: 0.5em;
+    vertical-align: -0.17em;
+    flex: none;
+    color: var(--ink);
+  }
+  .cat-cell { white-space: nowrap; }
+  .cat-select { display: inline-flex; align-items: center; }
+  .cat-select-icon { display: inline-flex; width: 1.55em; flex: none; }
 
   .topbar-title {
     font-family: var(--font-display);
@@ -3235,7 +3293,7 @@ INDEX_TEMPLATE = (
         <tbody>
           {% for category, values in category_summary.items() %}
             <tr>
-              <td>{{ category }}</td>
+              <td class="cat-cell">{{ category_icon(category) }}{{ category }}</td>
                 {% for value in values %}
               <td class="amount-cell">
                 <a href="{{ url_for('category_items',
@@ -3672,6 +3730,8 @@ DETAIL_TEMPLATE = (
                            value="{{ item.description }}" />
                   </td>
                   <td>
+                    <span class="cat-select">
+                    <span class="cat-select-icon">{{ category_icon(item.category) }}</span>
                     <select name="item-category">
                       {% for option in [
                         "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Kućni ljubimci","Lijekovi, troškovi liječenja",
@@ -3684,6 +3744,7 @@ DETAIL_TEMPLATE = (
                         </option>
                       {% endfor %}
                     </select>
+                    </span>
                   </td>
                   <td>
                     <input type="text"
@@ -3792,6 +3853,8 @@ DETAIL_TEMPLATE = (
           row.innerHTML = `
             <td><input type="text" name="item-description" /></td>
             <td>
+              <span class="cat-select">
+              <span class="cat-select-icon">{{ category_icon("Hrana") }}</span>
               <select name="item-category">
                 {% for option in [
                   "Hrana","Cigarete, alkohol, kave,...","Kućne potrepštine","Kućni ljubimci","Lijekovi, troškovi liječenja",
@@ -3802,6 +3865,7 @@ DETAIL_TEMPLATE = (
                   <option value="{{ option }}">{{ option }}</option>
                 {% endfor %}
               </select>
+              </span>
             </td>
             <td><input type="text" name="item-quantity" /></td>
             <td><input type="text" name="item-unit-price" /></td>
@@ -3821,6 +3885,24 @@ DETAIL_TEMPLATE = (
         });
 
         document.addEventListener('DOMContentLoaded', recalcItemsSum);
+
+        // Ikona kategorije lijevo od padajućeg izbornika prati odabranu opciju
+        const CATEGORY_ICON_SVG = {{ category_icon_map|tojson }};
+
+        function syncCategoryIcon(select) {
+          const holder = select.parentElement.querySelector('.cat-select-icon');
+          if (holder) holder.innerHTML = CATEGORY_ICON_SVG[select.value] || '';
+        }
+
+        document.addEventListener('change', function (event) {
+          if (event.target && event.target.name === 'item-category') {
+            syncCategoryIcon(event.target);
+          }
+        });
+
+        document.addEventListener('DOMContentLoaded', function () {
+          document.querySelectorAll('select[name="item-category"]').forEach(syncCategoryIcon);
+        });
 
         // --- Kalendar helper za polje "Datum" ---
         (function () {
@@ -3993,7 +4075,7 @@ CATEGORY_ITEMS_TEMPLATE = (
     </div>
 
     <div class="page">
-      <h2>Pregled kategorije "{{ category }}" za {{ month_name }} {{ year }}</h2>
+      <h2>{{ category_icon(category) }}Pregled kategorije "{{ category }}" za {{ month_name }} {{ year }}</h2>
       <p class="small-text">
         Ukupno: <strong>{{ ("%.2f"|format(total_amount)).replace(".", ",") }} €</strong>
       </p>
