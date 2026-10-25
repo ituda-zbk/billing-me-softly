@@ -39,7 +39,7 @@ Moze se postaviti kao prava environment varijabla (nacin se razlikuje po OS-u: `
 
 | Varijabla | Zadana vrijednost | Opis |
 |-----------|-------------------|------|
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model za OCR parsiranje |
+| `GEMINI_MODEL` | `gemini-3.5-flash` | Gemini model za OCR parsiranje |
 | `GEMINI_MAX_PARALLEL` | `1` | Broj paralelnih poziva prema Gemini API-ju (defaultno sekvencijalna obrada) |
 | `GEMINI_REQUESTS_PER_MINUTE` | `2` | Maksimalan broj zahtjeva po minuti (sliding window, 60 s) |
 | `GEMINI_MAX_429_RETRIES` | `4` | Broj ponovnih pokusaja kod rate limita (429) |

@@ -37,7 +37,7 @@ DEFAULT_LANG = "hrv"
 
 # --- Gemini API ---
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_MAX_PARALLEL = int(os.environ.get("GEMINI_MAX_PARALLEL", "1"))
 GEMINI_REQUESTS_PER_MINUTE = int(os.environ.get("GEMINI_REQUESTS_PER_MINUTE", "2"))

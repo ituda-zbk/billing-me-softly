@@ -1315,6 +1315,33 @@ def _image_to_inline_part(image_path: str) -> dict:
     return {"inline_data": {"mime_type": mime_type, "data": img_base64}}
 
 
+def _extract_model_text(data: dict, context: str) -> str:
+    """Spoji tekst SVIH dijelova (parts) prvog kandidata u Gemini odgovoru.
+
+    Gemini 3.x zna vratiti tekst razlomljen u više `parts` (2.5 Flash u praksi
+    vraća jedan) — čitanje samo parts[0] tada daje odrezan JSON. Dijelovi s
+    "thought": true (sažeci razmišljanja) i dijelovi bez teksta se preskaču.
+    """
+    try:
+        candidate = data["candidates"][0]
+        parts = candidate["content"]["parts"]
+    except Exception as exc:
+        raise RuntimeError(f"Neočekivan odgovor Gemini Vision modela ({context}): {data}") from exc
+
+    text_parts = [p["text"] for p in parts if isinstance(p, dict) and p.get("text") and not p.get("thought")]
+    finish_reason = candidate.get("finishReason")
+    if len(text_parts) > 1 or finish_reason != "STOP":
+        log_progress(
+            f"Gemini odgovor ({context}): finishReason={finish_reason}, "
+            f"dijelova s tekstom={len(text_parts)}/{len(parts)}"
+        )
+    if not text_parts:
+        raise RuntimeError(
+            f"Gemini Vision model ({context}) nije vratio tekst (finishReason={finish_reason}): {data}"
+        )
+    return "".join(text_parts)
+
+
 def call_gemini_vision_parser(image_path: str) -> dict:
     payload = {
         "contents": [
@@ -1335,10 +1362,7 @@ def call_gemini_vision_parser(image_path: str) -> dict:
     }
 
     data = _post_gemini_generate_content(payload)
-    try:
-        model_text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as exc:
-        raise RuntimeError(f"Neočekivan odgovor Gemini Vision modela: {data}") from exc
+    model_text = _extract_model_text(data, "jedna slika")
 
     return parse_llm_json(model_text)
 
@@ -1375,10 +1399,7 @@ def call_gemini_vision_batch_parser(image_paths: List[str]) -> Dict[int, Optiona
     }
 
     data = _post_gemini_generate_content(payload)
-    try:
-        model_text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as exc:
-        raise RuntimeError(f"Neočekivan odgovor Gemini Vision modela (batch): {data}") from exc
+    model_text = _extract_model_text(data, f"batch od {n} slika")
 
     parsed = parse_llm_batch_json(model_text)
     receipts = parsed.get("receipts", []) if isinstance(parsed, dict) else []

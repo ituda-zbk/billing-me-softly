@@ -65,7 +65,7 @@ Settings come from environment variables or from `~/BillingMeSoftly/.env` (real 
 | Variable | Default | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` | (required) | Google Gemini API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Model used for OCR |
+| `GEMINI_MODEL` | `gemini-3.5-flash` | Model used for OCR |
 | `BILLING_DATA_DIR` | `~/BillingMeSoftly` | Where `receipts.db` and `uploads/` are stored |
 | `ONEDRIVE_IMPORT_DIR` | *(empty)* | Default folder for the bulk-import form |
 | `GEMINI_IMAGES_PER_REQUEST` | `5` | Images sent per Gemini request |
